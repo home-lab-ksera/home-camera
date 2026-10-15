@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
 anyhow = "1.0"
-shiguredo_s3 = "2026.1.0-canary.0"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 proptest = "1"
