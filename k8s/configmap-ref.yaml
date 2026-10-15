@@ -4,5 +4,4 @@ metadata:
   name: sandbox-connection-info
   namespace: sandbox
 data:
-  RUSTFS_S3_ENDPOINT: http://rustfs-svc.rustfs.svc:9000
-  RUSTFS_S3_REGION: us-east-1
+  API_HUB_BASE_URL: http://api-hub.sandbox.svc:3000

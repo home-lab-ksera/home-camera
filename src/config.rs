@@ -5,10 +5,7 @@ use crate::error::AppError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub rtsp_url: String,
-    pub s3_endpoint: String,
-    pub s3_region: String,
-    pub aws_access_key_id: String,
-    pub aws_secret_access_key: String,
+    pub api_hub_base_url: String,
     pub s3_bucket: String,
     pub camera_id: String,
     pub record_seconds: u64,
@@ -48,10 +45,22 @@ impl AppConfig {
             });
         }
 
-        let s3_endpoint = required(vars, "RUSTFS_S3_ENDPOINT")?;
-        let s3_region = required(vars, "RUSTFS_S3_REGION")?;
-        let aws_access_key_id = required(vars, "AWS_ACCESS_KEY_ID")?;
-        let aws_secret_access_key = required(vars, "AWS_SECRET_ACCESS_KEY")?;
+        let api_hub_base_url = required(vars, "API_HUB_BASE_URL")?;
+        let url = reqwest::Url::parse(&api_hub_base_url).map_err(|e| AppError::InvalidEnv {
+            name: "API_HUB_BASE_URL",
+            reason: e.to_string(),
+        })?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AppError::InvalidEnv {
+                name: "API_HUB_BASE_URL",
+                reason: "must be an HTTP(S) base URL without query or fragment".to_string(),
+            });
+        }
+        let api_hub_base_url = api_hub_base_url.trim_end_matches('/').to_string();
         let s3_bucket = vars
             .get("S3_BUCKET")
             .cloned()
@@ -152,10 +161,7 @@ impl AppConfig {
 
         Ok(Self {
             rtsp_url,
-            s3_endpoint,
-            s3_region,
-            aws_access_key_id,
-            aws_secret_access_key,
+            api_hub_base_url,
             s3_bucket,
             camera_id,
             record_seconds,

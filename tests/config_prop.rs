@@ -10,14 +10,8 @@ fn base_env() -> HashMap<String, String> {
             "rtsp://camera.local/live".to_string(),
         ),
         (
-            "RUSTFS_S3_ENDPOINT".to_string(),
-            "http://rustfs-svc.rustfs.svc:9000".to_string(),
-        ),
-        ("RUSTFS_S3_REGION".to_string(), "us-east-1".to_string()),
-        ("AWS_ACCESS_KEY_ID".to_string(), "test-access".to_string()),
-        (
-            "AWS_SECRET_ACCESS_KEY".to_string(),
-            "test-secret".to_string(),
+            "API_HUB_BASE_URL".to_string(),
+            "http://api-hub.sandbox.svc:3000".to_string(),
         ),
     ])
 }
@@ -57,13 +51,7 @@ proptest! {
 
 #[test]
 fn missing_required_fields_fail() {
-    let required = [
-        "RTSP_URL",
-        "RUSTFS_S3_ENDPOINT",
-        "RUSTFS_S3_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-    ];
+    let required = ["RTSP_URL", "API_HUB_BASE_URL"];
 
     for key in required {
         let mut vars = base_env();
@@ -114,5 +102,21 @@ fn empty_new_ffmpeg_settings_are_rejected() {
         let mut vars = base_env();
         vars.insert(key.to_string(), "   ".to_string());
         assert!(AppConfig::from_map(&vars).is_err(), "{key} should fail");
+    }
+}
+
+#[test]
+fn invalid_api_hub_urls_are_rejected() {
+    for url in [
+        "",
+        "   ",
+        "file:///tmp/api",
+        "http://",
+        "http://api-hub?key=x",
+        "http://api-hub#fragment",
+    ] {
+        let mut vars = base_env();
+        vars.insert("API_HUB_BASE_URL".to_string(), url.to_string());
+        assert!(AppConfig::from_map(&vars).is_err(), "{url} should fail");
     }
 }

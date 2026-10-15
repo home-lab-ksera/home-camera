@@ -19,22 +19,11 @@ spec:
             - name: recorder
               image: harbor.qroksera.com/sandbox/home-camera:latest
               imagePullPolicy: IfNotPresent
-              envFrom:
-                - configMapRef:
-                    name: sandbox-connection-info
               env:
                 - name: RTSP_URL
                   value: "rtsp://s5kVuizVreFu2SxK:0FnaKGTm2bGgqxK2@192.168.10.15/live0"
-                - name: AWS_ACCESS_KEY_ID
-                  valueFrom:
-                    secretKeyRef:
-                      name: home-camera-secret
-                      key: AWS_ACCESS_KEY_ID
-                - name: AWS_SECRET_ACCESS_KEY
-                  valueFrom:
-                    secretKeyRef:
-                      name: home-camera-secret
-                      key: AWS_SECRET_ACCESS_KEY
+                - name: API_HUB_BASE_URL
+                  value: http://api-hub.sandbox.svc:3000
                 - name: S3_BUCKET
                   value: home-camera-recordings
                 - name: CAMERA_ID
