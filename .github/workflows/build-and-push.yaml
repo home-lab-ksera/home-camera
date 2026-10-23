@@ -4,6 +4,7 @@
 name: Build and Push to Harbor - home-camera
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main, master ]
   pull_request:
@@ -12,6 +13,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+
+concurrency:
+  group: harbor-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-image:
@@ -38,7 +43,7 @@ jobs:
         retention-days: 1
 
   push-image:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: build-image
     runs-on: home-camera-runners  # self-hosted runner
 
@@ -49,90 +54,41 @@ jobs:
         name: home-camera-image
         path: /tmp
 
-    - name: Load Docker image
+    - name: Install crane (verified release)
+      shell: bash
       run: |
-        echo "=== Load image on self-hosted runner ==="
-        gunzip -c /tmp/home-camera-image.tar.gz | docker load
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64) ARCH=x86_64; SHA256=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0 ;;
+          aarch64) ARCH=arm64; SHA256=898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110 ;;
+          *) echo "Unsupported architecture" >&2; exit 1 ;;
+        esac
+        mkdir -p "$RUNNER_TEMP/crane-bin"
+        curl --fail --silent --show-error --location \
+          "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_$ARCH.tar.gz" \
+          -o "$RUNNER_TEMP/crane.tar.gz"
+        echo "$SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum --check
+        tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
 
-    - name: Setup kubectl and Harbor credentials
+    - name: Push latest image without Docker
+      shell: bash
       run: |
-        echo "=== Setup kubectl and Harbor credentials ==="
-
-        # Install kubectl
-        echo "Installing kubectl..."
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/
-
-        # Configure kubectl for in-cluster access
-        echo "Configuring kubectl..."
-        export KUBECONFIG=/tmp/kubeconfig
-        kubectl config set-cluster default \
-            --server=https://kubernetes.default.svc \
-            --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-            --kubeconfig=$KUBECONFIG
-        kubectl config set-credentials default \
-            --token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) \
-            --kubeconfig=$KUBECONFIG
-        kubectl config set-context default \
-            --cluster=default --user=default \
-            --kubeconfig=$KUBECONFIG
-        kubectl config use-context default --kubeconfig=$KUBECONFIG
-
-        # Get Harbor credentials
-        echo "Getting Harbor credentials..."
-        kubectl get secret harbor-auth -n arc-systems -o jsonpath='{.data.HARBOR_USERNAME}' | base64 -d > /tmp/harbor_username
-        kubectl get secret harbor-auth -n arc-systems -o jsonpath='{.data.HARBOR_PASSWORD}' | base64 -d > /tmp/harbor_password
-        kubectl get secret harbor-auth -n arc-systems -o jsonpath='{.data.HARBOR_URL}' | base64 -d > /tmp/harbor_url
-        kubectl get secret harbor-auth -n arc-systems -o jsonpath='{.data.HARBOR_PROJECT}' | base64 -d > /tmp/harbor_project
-        kubectl get secret ca-key-pair -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/harbor_ca.crt
-
-        chmod 600 /tmp/harbor_*
-        echo "✅ Harbor credentials retrieved successfully"
-
-    - name: Tag and push images using Docker
-      run: |
-        echo "=== Tag and push image on self-hosted runner ==="
-
-        HARBOR_USERNAME=$(cat /tmp/harbor_username)
-        HARBOR_PASSWORD=$(cat /tmp/harbor_password)
-        HARBOR_URL="harbor.internal.qroksera.com"
-        HARBOR_PROJECT=$(cat /tmp/harbor_project)
-        IMAGE_SHA_TAG="${{ github.sha }}"
-        IMAGE_LATEST_TAG="latest"
-
-        # 内部CAを信頼ストアに追加
-        echo "Installing internal CA..."
-        sudo cp /tmp/harbor_ca.crt /usr/local/share/ca-certificates/harbor-internal-ca.crt
-        sudo update-ca-certificates
-
-        # Docker用のCA設定
-        echo "Configuring Docker CA..."
-        sudo mkdir -p /etc/docker/certs.d/harbor.internal.qroksera.com
-        sudo cp /tmp/harbor_ca.crt /etc/docker/certs.d/harbor.internal.qroksera.com/ca.crt
-
-        # Load済みのローカルimageをHarborタグに付け替える
-        docker tag home-camera:ci $HARBOR_URL/$HARBOR_PROJECT/home-camera:$IMAGE_LATEST_TAG
-        docker tag home-camera:ci $HARBOR_URL/$HARBOR_PROJECT/home-camera:$IMAGE_SHA_TAG
-
-        # /etc/hostsにharbor.internal.qroksera.comを追加
-        echo "192.168.122.100 harbor.internal.qroksera.com" | sudo tee -a /etc/hosts
-
-        # Harborにログイン
-        echo "Logging in to Harbor..."
-        docker login $HARBOR_URL -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
-
-        # Harborへpush
-        echo "Pushing to Harbor..."
-        docker push $HARBOR_URL/$HARBOR_PROJECT/home-camera:$IMAGE_LATEST_TAG
-        docker push $HARBOR_URL/$HARBOR_PROJECT/home-camera:$IMAGE_SHA_TAG
-
-        echo "✅ Images pushed successfully to Harbor"
-        echo "📦 Pushed tags: $IMAGE_LATEST_TAG, $IMAGE_SHA_TAG"
+        set -euo pipefail
+        umask 077
+        export DOCKER_CONFIG="$RUNNER_TEMP/harbor-auth"
+        mkdir -p "$DOCKER_CONFIG"
+        CRANE="$RUNNER_TEMP/crane-bin/crane"
+        HARBOR_URL=$(cat /etc/harbor-auth/HARBOR_URL)
+        HARBOR_PROJECT=$(cat /etc/harbor-auth/HARBOR_PROJECT)
+        HARBOR_USERNAME=$(cat /etc/harbor-auth/HARBOR_USERNAME)
+        "$CRANE" auth login "$HARBOR_URL" --username "$HARBOR_USERNAME" \
+          --password-stdin < /etc/harbor-auth/HARBOR_PASSWORD
+        gunzip -c /tmp/home-camera-image.tar.gz > "$RUNNER_TEMP/image.tar"
+        "$CRANE" push "$RUNNER_TEMP/image.tar" "$HARBOR_URL/$HARBOR_PROJECT/home-camera:latest"
 
     - name: Cleanup
       if: always()
+      shell: bash
       run: |
-        echo "=== Cleanup ==="
-        rm -f /tmp/harbor_* /tmp/kubeconfig /tmp/home-camera-image.tar.gz
-        echo "✅ Cleanup completed"
+        rm -rf "$RUNNER_TEMP/harbor-auth" "$RUNNER_TEMP/crane-bin"
+        rm -f "$RUNNER_TEMP/crane.tar.gz" "$RUNNER_TEMP/image.tar" /tmp/home-camera-image.tar.gz
