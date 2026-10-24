@@ -23,6 +23,8 @@ pub async fn upload_file(config: &AppConfig, key: &str, path: &Path) -> Result<(
     // 録画全体をメモリに載せず、multipart upload の管理は api-hub に委譲する。
     let response = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(3600))
         .build()
         .map_err(|e| AppError::S3Upload(e.to_string()))?
         .post(format!("{}/s3/put_object_stream", config.api_hub_base_url))

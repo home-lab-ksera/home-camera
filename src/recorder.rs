@@ -72,7 +72,7 @@ pub fn record_to_mp4(
         .map_err(|e| AppError::Recording(format!("failed to start ffmpeg: {e}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).replace(rtsp_url, "[camera stream]");
         let lines: Vec<_> = stderr.lines().collect();
         let reason = if lines.is_empty() {
             "unknown ffmpeg error".to_string()

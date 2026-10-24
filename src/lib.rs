@@ -5,3 +5,5 @@ pub mod recorder;
 pub mod retry;
 pub mod slack_client;
 pub mod storage;
+
+pub mod persistent;

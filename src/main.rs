@@ -15,6 +15,9 @@ const JST_OFFSET_HOURS: i8 = 9;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if home_camera::persistent::dispatch().await? {
+        return Ok(());
+    }
     let http = Client::builder().build()?;
     let _ = post_message(&http, "log", "camera start").await;
     if let Err(e) = run().await {
@@ -33,7 +36,10 @@ async fn run() -> Result<(), AppError> {
     let object_key = build_object_key(&config.camera_id, now);
 
     let temp_file = temp_mp4_path(&config.camera_id, now.unix_timestamp());
-    println!("recording started: {}", config.rtsp_url);
+    println!(
+        "recording started: camera={}",
+        home_camera::key::sanitize_camera_id(&config.camera_id)
+    );
     println!("temp file: {}", temp_file.display());
 
     let stats = record_to_mp4(
