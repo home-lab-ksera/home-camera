@@ -29,3 +29,8 @@ cargo test --locked --lib persistent::tests -- --ignored
 
 テスト映像は人工的な青一色のMP4。連続segment生成、DB/S3停止、PUT後DB確定前停止、不完全segment回復を隔離環境で検証する。
 [旧CronJobからの切替](../../k8s_myHome/docs/application-postgresql-cutover.md)は旧writerの停止確認後に行う。
+
+spoolの集計はuploaderと並行するため、走査中に削除されたファイル・sessionを除外する。
+その他の集計エラーでは直近の集計値を保持して録画ループを継続し、
+`home_camera_spool_stats_success=0`を公開する。次の集計成功で1へ戻る。
+この値が0の間は容量・最古滞留時間の値が古い可能性がある。空き容量の確認と録画の容量制限は継続する。

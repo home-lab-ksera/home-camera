@@ -244,26 +244,46 @@ struct Metrics {
     partial: u64,
     restarts: u64,
     heartbeat: Option<Instant>,
+    stats_success: bool,
+}
+// uploaderは独立して送信済みファイル・sessionを削除する。走査後の消失は正常。
+fn present<T>(result: std::io::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 fn stats(root: &Path) -> Result<(u64, f64, u64)> {
     let mut bytes = 0;
     let mut oldest = OffsetDateTime::now_utc().unix_timestamp();
     let mut partial = 0;
     for session in sessions(root)? {
-        for entry in fs::read_dir(&session)? {
-            let entry = entry?;
+        let Some(entries) = present(fs::read_dir(&session))? else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry) = present(entry)? else {
+                continue;
+            };
             let path = entry.path();
             if path
                 .extension()
                 .is_some_and(|v| v == "mp4" || v == "part" || v == "corrupt")
             {
-                bytes += entry.metadata()?.len();
+                let Some(metadata) = present(entry.metadata())? else {
+                    continue;
+                };
+                bytes += metadata.len();
             }
             if path.extension().is_some_and(|v| v == "corrupt") {
                 partial += 1;
             }
             if path.extension().is_some_and(|v| v == "json") {
-                if let Ok(segment) = serde_json::from_reader::<_, Segment>(File::open(&path)?) {
+                let Some(file) = present(File::open(&path))? else {
+                    continue;
+                };
+                if let Ok(segment) = serde_json::from_reader::<_, Segment>(file) {
                     oldest = oldest.min(
                         OffsetDateTime::parse(&segment.actual_start_at, &Rfc3339)?.unix_timestamp(),
                     );
@@ -312,7 +332,7 @@ async fn recorder() -> Result<()> {
         .parse()?;
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let router=Router::new().route("/health",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{if value.lock().unwrap().heartbeat.is_some_and(|time|time.elapsed()<Duration::from_secs(60)){StatusCode::OK}else{StatusCode::SERVICE_UNAVAILABLE}}))
-        .route("/metrics",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{let v=value.lock().unwrap();format!("home_camera_spool_bytes {}\nhome_camera_spool_oldest_age_seconds {}\nhome_camera_spool_blocked {}\nhome_camera_recording_active {}\nhome_camera_partial_segments {}\nhome_camera_recorder_restarts_total {}\n",v.bytes,v.oldest_age,u8::from(v.blocked),u8::from(v.active),v.partial,v.restarts)})).with_state(metrics.clone());
+        .route("/metrics",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{let v=value.lock().unwrap();format!("home_camera_spool_bytes {}\nhome_camera_spool_oldest_age_seconds {}\nhome_camera_spool_blocked {}\nhome_camera_recording_active {}\nhome_camera_partial_segments {}\nhome_camera_recorder_restarts_total {}\nhome_camera_spool_stats_success {}\n",v.bytes,v.oldest_age,u8::from(v.blocked),u8::from(v.active),v.partial,v.restarts,u8::from(v.stats_success))})).with_state(metrics.clone());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9090").await?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -323,7 +343,17 @@ async fn recorder() -> Result<()> {
     let mut next_sample = Instant::now();
     loop {
         if Instant::now() >= next_sample {
-            sampled = stats(&root)?;
+            match stats(&root) {
+                Ok(value) => {
+                    sampled = value;
+                    metrics.lock().unwrap().stats_success = true;
+                }
+                Err(error) => {
+                    // 集計の失敗でFFmpegを停止しない。直近の値を保持し監視へ失敗を伝える。
+                    metrics.lock().unwrap().stats_success = false;
+                    eprintln!("camera spool statistics failed: {error:#}");
+                }
+            }
             next_sample = Instant::now() + Duration::from_secs(15);
         }
         let (bytes, age, partial) = sampled;
@@ -606,6 +636,44 @@ mod tests {
         assert!(lock(root.path(), "recorder.lock").is_err());
         drop(first);
         assert!(lock(root.path(), "recorder.lock").is_ok());
+    }
+
+    #[test]
+    fn spool_statistics_tolerate_uploader_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session");
+        fs::create_dir(&session).unwrap();
+        for i in 0..1000 {
+            fs::write(session.join(format!("{i}.mp4")), [0_u8]).unwrap();
+        }
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = running.clone();
+        let writer = std::thread::spawn(move || {
+            while flag.load(Ordering::Relaxed) {
+                for i in 0..1000 {
+                    let path = session.join(format!("{i}.mp4"));
+                    fs::remove_file(&path).unwrap();
+                    fs::write(path, [0_u8]).unwrap();
+                }
+            }
+        });
+        // 修正前はmetadata()のENOENTがここから録画ループへ伝播する。
+        let result = (0..100).try_for_each(|_| stats(root.path()).map(|_| ()));
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+        result.unwrap();
+        // 消失以外のI/O障害は隠さず、recorderの集計失敗メトリクスへ伝える。
+        assert!(present::<File>(Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+        assert!(
+            present(File::open(root.path().join("removed.json")))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            present(fs::read_dir(root.path().join("removed-session")))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
