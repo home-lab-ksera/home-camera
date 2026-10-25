@@ -1,19 +1,12 @@
 name: Recording recovery tests
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main, master]
 jobs:
   recordings:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_PASSWORD: test-only
-          POSTGRES_DB: camera_test
-        ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,4 +17,3 @@ jobs:
         env:
           FFMPEG_BIN: /usr/bin/ffmpeg
           FFPROBE_BIN: /usr/bin/ffprobe
-          TEST_DATABASE_URL: postgres://postgres:test-only@localhost:5432/camera_test

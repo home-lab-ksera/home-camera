@@ -18,7 +18,6 @@ uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"
 nix = { version = "0.30", features = ["signal"] }
 axum = "0.8.8"
-sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "json", "migrate", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

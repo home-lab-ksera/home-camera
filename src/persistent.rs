@@ -1,4 +1,4 @@
-//! 録画はDBに依存せずPVCへ確定し、別プロセスがDBとS3へ転送する。
+//! PVC上の完成動画とmanifestを正本にし、単一uploaderがS3へ転送する。
 use crate::{config::AppConfig, key::sanitize_camera_id};
 use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
@@ -6,10 +6,6 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{
-    ConnectOptions, PgPool, Row,
-    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
-};
 use std::{
     collections::HashMap,
     env,
@@ -33,36 +29,39 @@ struct Segment {
     object_key: String,
     size: u64,
     checksum: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    next_attempt_at: i64,
 }
 
-async fn connect() -> Result<PgPool> {
-    let options = if let Ok(url) = env::var("DATABASE_URL") {
-        url.parse::<PgConnectOptions>()?
-    } else {
-        PgConnectOptions::new()
-            .host(&env::var("PGHOST")?)
-            .username("app")
-            .database(&env::var("PGDATABASE")?)
-            .password(&env::var("PGPASSWORD")?)
-            .ssl_mode(PgSslMode::VerifyFull)
-            .ssl_root_cert(env::var("PGSSLROOTCERT")?)
-    };
-    let max: u32 = env::var("PGPOOL_MAX")
-        .unwrap_or_else(|_| "2".into())
-        .parse()?;
-    if !(1..=2).contains(&max) {
-        bail!("PGPOOL_MAX must be 1..2");
+fn read_segment(path: &Path) -> Result<Segment> {
+    let segment: Segment = serde_json::from_reader(File::open(path)?)?;
+    let start = OffsetDateTime::parse(&segment.actual_start_at, &Rfc3339)?;
+    let end = OffsetDateTime::parse(&segment.actual_end_at, &Rfc3339)?;
+    if segment.id.is_empty()
+        || segment.camera_id.is_empty()
+        || segment.object_key.is_empty()
+        || segment.size == 0
+        || end <= start
+        || segment.checksum.len() != 64
+        || !segment.checksum.bytes().all(|b| b.is_ascii_hexdigit())
+        || Path::new(&segment.file_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            != Some(segment.file_name.as_str())
+        || path
+            .with_extension("mp4")
+            .file_name()
+            .and_then(|s| s.to_str())
+            != Some(segment.file_name.as_str())
+        || segment.next_attempt_at < 0
+    {
+        bail!("invalid segment manifest; preserving for inspection");
     }
-    Ok(PgPoolOptions::new()
-        .max_connections(max)
-        .acquire_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(60))
-        .connect_lazy_with(
-            options
-                .application_name("camera-uploader")
-                .disable_statement_logging(),
-        ))
+    Ok(segment)
 }
+
 pub async fn dispatch() -> Result<bool> {
     let mode = env::args().nth(1).unwrap_or_default();
     if mode.is_empty() {
@@ -70,9 +69,8 @@ pub async fn dispatch() -> Result<bool> {
     }
     match mode.as_str() {
         "--migrate" => {
-            sqlx::migrate!("./migrations")
-                .run(&connect().await?)
-                .await?;
+            // 切替前のGitOps migration Jobとの互換。DBは変更しない（P6で撤去）。
+            eprintln!("camera no longer requires database migrations");
         }
         "--record" => recorder().await?,
         "--upload" => uploader().await?,
@@ -207,6 +205,8 @@ async fn finish(path: &Path, camera: &str) -> Result<()> {
         ),
         size: metadata.len(),
         checksum: checksum(&mp4)?,
+        attempts: 0,
+        next_attempt_at: 0,
     };
     atomic_json(&mp4.with_extension("json"), &segment)?;
     Ok(())
@@ -242,6 +242,8 @@ struct Metrics {
     blocked: bool,
     active: bool,
     partial: u64,
+    invalid_manifests: u64,
+    stalled: bool,
     restarts: u64,
     heartbeat: Option<Instant>,
     stats_success: bool,
@@ -254,10 +256,11 @@ fn present<T>(result: std::io::Result<T>) -> Result<Option<T>> {
         Err(error) => Err(error.into()),
     }
 }
-fn stats(root: &Path) -> Result<(u64, f64, u64)> {
+fn stats(root: &Path) -> Result<(u64, f64, u64, u64)> {
     let mut bytes = 0;
     let mut oldest = OffsetDateTime::now_utc().unix_timestamp();
     let mut partial = 0;
+    let mut invalid = 0;
     for session in sessions(root)? {
         let Some(entries) = present(fs::read_dir(&session))? else {
             continue;
@@ -280,13 +283,15 @@ fn stats(root: &Path) -> Result<(u64, f64, u64)> {
                 partial += 1;
             }
             if path.extension().is_some_and(|v| v == "json") {
-                let Some(file) = present(File::open(&path))? else {
-                    continue;
-                };
-                if let Ok(segment) = serde_json::from_reader::<_, Segment>(file) {
-                    oldest = oldest.min(
-                        OffsetDateTime::parse(&segment.actual_start_at, &Rfc3339)?.unix_timestamp(),
-                    );
+                match read_segment(&path) {
+                    Ok(segment) => {
+                        oldest = oldest.min(
+                            OffsetDateTime::parse(&segment.actual_start_at, &Rfc3339)?
+                                .unix_timestamp(),
+                        )
+                    }
+                    Err(_) if !path.exists() => {} // uploaderによる削除と競合した場合
+                    Err(_) => invalid += 1,
                 }
             }
         }
@@ -295,6 +300,7 @@ fn stats(root: &Path) -> Result<(u64, f64, u64)> {
         bytes,
         (OffsetDateTime::now_utc().unix_timestamp() - oldest).max(0) as f64,
         partial,
+        invalid,
     ))
 }
 fn allowed(now: OffsetDateTime) -> bool {
@@ -316,6 +322,22 @@ async fn stop(child: &mut Child) {
     }
 }
 
+fn rtsp_command(url: &str, timeout_us: u64) -> Command {
+    let mut command = Command::new(env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".into()));
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        &timeout_us.to_string(),
+        "-i",
+        url,
+    ]);
+    command
+}
+
 async fn recorder() -> Result<()> {
     let config = AppConfig::from_env()?;
     let root = root();
@@ -332,14 +354,15 @@ async fn recorder() -> Result<()> {
         .parse()?;
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let router=Router::new().route("/health",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{if value.lock().unwrap().heartbeat.is_some_and(|time|time.elapsed()<Duration::from_secs(60)){StatusCode::OK}else{StatusCode::SERVICE_UNAVAILABLE}}))
-        .route("/metrics",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{let v=value.lock().unwrap();format!("home_camera_spool_bytes {}\nhome_camera_spool_oldest_age_seconds {}\nhome_camera_spool_blocked {}\nhome_camera_recording_active {}\nhome_camera_partial_segments {}\nhome_camera_recorder_restarts_total {}\nhome_camera_spool_stats_success {}\n",v.bytes,v.oldest_age,u8::from(v.blocked),u8::from(v.active),v.partial,v.restarts,u8::from(v.stats_success))})).with_state(metrics.clone());
+        .route("/metrics",get(|State(value):State<Arc<Mutex<Metrics>>>|async move{let v=value.lock().unwrap();format!("home_camera_spool_bytes {}\nhome_camera_spool_oldest_age_seconds {}\nhome_camera_spool_blocked {}\nhome_camera_recording_active {}\nhome_camera_partial_segments {}\nhome_camera_recorder_restarts_total {}\nhome_camera_spool_stats_success {}\nhome_camera_invalid_manifests {}\nhome_camera_recording_stalled {}\n",v.bytes,v.oldest_age,u8::from(v.blocked),u8::from(v.active),v.partial,v.restarts,u8::from(v.stats_success),v.invalid_manifests,u8::from(v.stalled))})).with_state(metrics.clone());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9090").await?;
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut child: Option<(Child, PathBuf)> = None;
     let mut next_start = Instant::now();
-    let mut sampled = (0, 0.0, 0);
+    let mut sampled = (0, 0.0, 0, 0);
+    let mut last_progress = Instant::now();
     let mut next_sample = Instant::now();
     loop {
         if Instant::now() >= next_sample {
@@ -356,14 +379,18 @@ async fn recorder() -> Result<()> {
             }
             next_sample = Instant::now() + Duration::from_secs(15);
         }
-        let (bytes, age, partial) = sampled;
+        let (bytes, age, partial, invalid) = sampled;
         let blocked = bytes >= max || fs2::available_space(&root)? < 2 * 1024 * 1024 * 1024;
         let active_time = allowed(OffsetDateTime::now_utc());
+        if !active_time {
+            metrics.lock().unwrap().stalled = false;
+        }
         {
             let mut v = metrics.lock().unwrap();
             v.bytes = bytes;
             v.oldest_age = age;
             v.partial = partial;
+            v.invalid_manifests = invalid;
             v.blocked = blocked;
             v.active = child.is_some();
             v.heartbeat = Some(Instant::now());
@@ -372,17 +399,8 @@ async fn recorder() -> Result<()> {
             let session = root.join(uuid::Uuid::new_v4().to_string());
             fs::create_dir(&session)?;
             File::create(session.join(".active"))?;
-            let mut command = Command::new("ffmpeg");
+            let mut command = rtsp_command(&config.rtsp_url, 30_000_000);
             command.args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-rtsp_transport",
-                "tcp",
-                "-rw_timeout",
-                "30000000",
-                "-i",
-                &config.rtsp_url,
                 "-map",
                 "0:v:0",
                 "-map",
@@ -433,6 +451,7 @@ async fn recorder() -> Result<()> {
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
             child = Some((command.spawn().context("could not start ffmpeg")?, session));
+            last_progress = Instant::now();
         }
         if let Some((process, session)) = &mut child {
             // muxerが閉じたファイルだけをCSVから確定する。現在書き込み中のpartは送らない。
@@ -441,6 +460,8 @@ async fn recorder() -> Result<()> {
                     if let Some(name) = line.split(',').next() {
                         let path = session.join(name.trim_matches('"'));
                         if path.exists() && path.extension().is_some_and(|v| v == "part") {
+                            last_progress = Instant::now();
+                            metrics.lock().unwrap().stalled = false;
                             if let Err(error) = finish(&path, &config.camera_id).await {
                                 eprintln!("closed segment could not be finalized: {error}");
                                 fs::rename(&path, path.with_extension("corrupt"))?;
@@ -450,12 +471,17 @@ async fn recorder() -> Result<()> {
                 }
             }
             let exited = process.try_wait()?.is_some();
-            if exited || !active_time || blocked {
+            // 接続猶予60秒とkeyframe境界の余裕を含め、完成segmentの停止を検知する。
+            let stalled = last_progress.elapsed() > Duration::from_secs(seconds * 2 + 60);
+            if stalled {
+                metrics.lock().unwrap().stalled = true;
+            }
+            if exited || stalled || !active_time || blocked {
                 stop(process).await;
                 child = None;
                 recover(&root, &config.camera_id).await?;
                 next_start = Instant::now() + Duration::from_secs(10);
-                metrics.lock().unwrap().restarts += u64::from(exited);
+                metrics.lock().unwrap().restarts += u64::from(exited || stalled);
             }
         }
         tokio::select! {_=terminate.recv()=>break,_=interrupt.recv()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
@@ -471,7 +497,6 @@ async fn recorder() -> Result<()> {
 async fn uploader() -> Result<()> {
     let root = root();
     let _lock = lock(&root, "uploader.lock")?;
-    let pool = connect().await?;
     // uploaderはカメラに接続せず、RTSP資格情報も必要としない。
     let mut vars: HashMap<String, String> = env::vars().collect();
     vars.entry("RTSP_URL".into())
@@ -482,47 +507,81 @@ async fn uploader() -> Result<()> {
         .timeout(Duration::from_secs(3600))
         .build()?;
     loop {
-        if let Err(error) = upload_one(&root, &pool, &config, &http).await {
+        if let Err(error) = upload_one(&root, &config, &http).await {
             eprintln!("camera upload retry: {error:#}");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
-async fn upload_one(
-    root: &Path,
-    pool: &PgPool,
+async fn transfer(
+    segment: &Segment,
+    file: &Path,
     config: &AppConfig,
     http: &reqwest::Client,
-) -> Result<bool> {
-    let mut pending = Vec::new();
-    let mut records = Vec::new();
-    for path in manifests(root)? {
-        let segment: Segment = serde_json::from_reader(File::open(&path)?)?;
-        let file = path.parent().unwrap().join(&segment.file_name);
-        records.push(json!({"id":segment.id,"camera_id":segment.camera_id,"started":segment.actual_start_at,"ended":segment.actual_end_at,"path":file.to_str().context("invalid spool path")?,"key":segment.object_key,"size":segment.size,"checksum":segment.checksum}));
-        pending.push((segment.id, path, file));
+) -> Result<()> {
+    let local = present(file.metadata())?;
+    if let Some(metadata) = &local {
+        if metadata.len() != segment.size || checksum(file)? != segment.checksum {
+            bail!("spool file changed; preserving for inspection");
+        }
     }
-    if !records.is_empty() {
-        // 滞留中の同じ行を5秒ごとにUPDATEしてWALを増やさず、一括登録・照合する。
-        sqlx::query("INSERT INTO recordings(id,camera_id,actual_start_at,actual_end_at,spool_path,object_key,size,checksum) SELECT r.id,r.camera_id,r.started::timestamptz,r.ended::timestamptz,r.path,r.key,r.size,r.checksum FROM jsonb_to_recordset($1) AS r(id text,camera_id text,started text,ended text,path text,key text,size bigint,checksum text) ON CONFLICT(id) DO NOTHING")
-            .bind(json!(records)).execute(pool).await?;
-        let ids: Vec<_> = pending.iter().map(|(id, _, _)| id.clone()).collect();
-        let stored: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM recordings WHERE id=ANY($1) AND state='stored'")
-                .bind(ids)
-                .fetch_all(pool)
-                .await?;
-        for (id, path, file) in pending {
-            if stored.contains(&id) {
-                if file.exists() {
-                    fs::remove_file(file)?;
-                }
-                fs::remove_file(path)?;
+    let head = || {
+        http.post(format!("{}/s3/head_object", config.api_hub_base_url))
+            .json(&json!({"bucket":config.s3_bucket,"key":segment.object_key}))
+            .send()
+    };
+    let mut response = head().await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        if local.is_none() {
+            bail!("recording missing from both spool and S3");
+        }
+        crate::storage::upload_file(config, &segment.object_key, file).await?;
+        response = head().await?;
+    }
+    let value: Value = response.error_for_status()?.json().await?;
+    // remote checksum保証ではなく固定キーとサイズの照合。
+    if value["content_length"].as_u64() != Some(segment.size) {
+        bail!("stored recording size mismatch");
+    }
+    Ok(())
+}
+
+async fn upload_one(root: &Path, config: &AppConfig, http: &reqwest::Client) -> Result<bool> {
+    let mut attempted = false;
+    for path in manifests(root)? {
+        let mut segment = match read_segment(&path) {
+            Ok(segment) => segment,
+            Err(error) => {
+                eprintln!("invalid camera manifest {}: {error}", path.display());
+                continue;
+            }
+        };
+        if segment.next_attempt_at > OffsetDateTime::now_utc().unix_timestamp() {
+            continue;
+        }
+        attempted = true;
+        let file = path
+            .parent()
+            .context("session directory missing")?
+            .join(&segment.file_name);
+        match transfer(&segment, &file, config, http).await {
+            Ok(()) => {
+                // 動画を先に削除。途中停止で残ったmanifestは次回S3を照合して解放する。
+                present(fs::remove_file(&file))?;
+                fs::remove_file(&path)?;
+                File::open(path.parent().unwrap())?.sync_all()?;
+            }
+            Err(error) => {
+                eprintln!("camera upload retry for {}: {error:#}", segment.id);
+                segment.attempts = segment.attempts.saturating_add(1);
+                segment.next_attempt_at = OffsetDateTime::now_utc().unix_timestamp()
+                    + (10_i64 * 2_i64.pow(segment.attempts.min(7))).min(900);
+                atomic_json(&path, &segment)?;
             }
         }
     }
-    // 完了済みsessionの小さなCSVも残し続けない。稼働中・作成直後のdirectoryは触らない。
+    // 稼働中・異常を含むsessionを保持し、CSVだけになった完了sessionを整理する。
     for session in sessions(root)? {
         if session.join(".active").exists()
             || !session
@@ -541,66 +600,7 @@ async fn upload_one(
             fs::remove_dir(session)?;
         }
     }
-    sqlx::query("UPDATE recordings SET state='retry',next_attempt_at=now(),last_error='upload lease expired' WHERE state='uploading' AND lease_until<now()").execute(pool).await?;
-    let row=sqlx::query("WITH candidate AS(SELECT id FROM recordings WHERE state IN ('pending','retry') AND next_attempt_at<=now() ORDER BY actual_start_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE recordings r SET state='uploading',attempts=attempts+1,claim_token=gen_random_uuid(),lease_until=now()+interval '5 minutes' FROM candidate c WHERE r.id=c.id RETURNING r.* ,r.claim_token::text AS token").fetch_optional(pool).await?;
-    let Some(row) = row else { return Ok(false) };
-    let id: String = row.get("id");
-    let token: String = row.get("token");
-    let key: String = row.get("object_key");
-    let path = PathBuf::from(row.get::<String, _>("spool_path"));
-    let size: i64 = row.get("size");
-    let transfer = async {
-        if path.metadata()?.len() != size as u64
-            || checksum(&path)? != row.get::<String, _>("checksum")
-        {
-            bail!("spool file changed; preserving file for inspection");
-        }
-        let metadata = |response: Value| -> Result<Option<String>> {
-            if response["content_length"].as_i64() != Some(size) {
-                bail!("stored recording size mismatch");
-            }
-            Ok(response["e_tag"].as_str().map(str::to_owned))
-        };
-        let head = http
-            .post(format!("{}/s3/head_object", config.api_hub_base_url))
-            .json(&json!({"bucket":config.s3_bucket,"key":key}))
-            .send()
-            .await?;
-        if head.status().is_success() {
-            return metadata(head.json().await?);
-        }
-        if head.status() != reqwest::StatusCode::NOT_FOUND {
-            bail!("recording HEAD failed: {}", head.status());
-        }
-        crate::storage::upload_file(config, &key, &path).await?;
-        let head = http
-            .post(format!("{}/s3/head_object", config.api_hub_base_url))
-            .json(&json!({"bucket":config.s3_bucket,"key":key}))
-            .send()
-            .await?
-            .error_for_status()?;
-        metadata(head.json().await?)
-    };
-    tokio::pin!(transfer);
-    let result = loop {
-        tokio::select! {result=&mut transfer=>break result,_=tokio::time::sleep(Duration::from_secs(60))=>{
-            let update=sqlx::query("UPDATE recordings SET lease_until=now()+interval '5 minutes' WHERE id=$1 AND claim_token=$2::uuid AND state='uploading'").bind(&id).bind(&token).execute(pool).await?;
-            if update.rows_affected()!=1{bail!("upload lease lost");}
-        }}
-    };
-    match result {
-        Ok(etag) => {
-            let update=sqlx::query("UPDATE recordings SET state='stored',stored_at=now(),etag=$3,lease_until=NULL,last_error=NULL WHERE id=$1 AND claim_token=$2::uuid AND state='uploading'").bind(&id).bind(&token).bind(etag).execute(pool).await?;
-            if update.rows_affected() == 1 {
-                fs::remove_file(&path)?;
-                fs::remove_file(path.with_extension("json"))?;
-            }
-        }
-        Err(error) => {
-            sqlx::query("UPDATE recordings SET state='retry',next_attempt_at=now()+make_interval(secs=>LEAST(900,10*power(2,LEAST(attempts,7)))::double precision),lease_until=NULL,last_error=$3 WHERE id=$1 AND claim_token=$2::uuid AND state='uploading'").bind(&id).bind(&token).bind(format!("{error:#}").chars().take(2000).collect::<String>()).execute(pool).await?;
-        }
-    }
-    Ok(true)
+    Ok(attempted)
 }
 
 #[cfg(test)]
@@ -784,8 +784,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires FFPROBE_BIN and isolated TEST_DATABASE_URL"]
-    async fn spool_survives_database_and_s3_outages() {
+    #[ignore = "requires FFPROBE_BIN"]
+    async fn spool_survives_s3_outages() {
         let root = tempfile::tempdir().unwrap();
         let session = root.path().join("fixture-session");
         fs::create_dir(&session).unwrap();
@@ -802,48 +802,11 @@ mod tests {
         assert!(segment.size > 0);
         assert_eq!(segment.checksum.len(), 64);
         assert!(path.with_extension("mp4").exists());
-        let unavailable = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(150))
-            .connect_lazy("postgres://127.0.0.1:1/no_database")
-            .unwrap();
         let vars = HashMap::from([
             ("RTSP_URL".into(), "rtsp://unused".into()),
             ("API_HUB_BASE_URL".into(), "http://127.0.0.1:1".into()),
         ]);
         let mut config = AppConfig::from_map(&vars).unwrap();
-        assert!(
-            upload_one(root.path(), &unavailable, &config, &reqwest::Client::new())
-                .await
-                .is_err()
-        );
-        assert!(manifest.exists());
-        assert!(path.with_extension("mp4").exists());
-
-        let url = env::var("TEST_DATABASE_URL").expect("isolated database required");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        let schema = format!("camera_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let search = format!("SET search_path TO {schema}");
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .after_connect(move |connection, _| {
-                let search = search.clone();
-                Box::pin(async move {
-                    sqlx::query(&search).execute(connection).await?;
-                    Ok(())
-                })
-            })
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let mock = Mock::default();
         mock.unavailable.store(true, Ordering::SeqCst);
         let app = Router::new()
@@ -856,33 +819,19 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let http = reqwest::Client::new();
-        assert!(
-            upload_one(root.path(), &pool, &config, &http)
-                .await
-                .unwrap()
-        );
+        assert!(upload_one(root.path(), &config, &http).await.unwrap());
         assert!(manifest.exists());
         assert_eq!(mock.uploads.load(Ordering::SeqCst), 0);
         mock.unavailable.store(false, Ordering::SeqCst);
-        sqlx::query("UPDATE recordings SET next_attempt_at=now()")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(
-            upload_one(root.path(), &pool, &config, &http)
-                .await
-                .unwrap()
-        );
+        let mut retry = read_segment(&manifest).unwrap();
+        assert!(retry.next_attempt_at > 0);
+        retry.next_attempt_at = 0;
+        atomic_json(&manifest, &retry).unwrap();
+        assert!(upload_one(root.path(), &config, &http).await.unwrap());
         assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
         assert!(!manifest.exists());
         assert!(!path.with_extension("mp4").exists());
-        let state: String = sqlx::query_scalar("SELECT state FROM recordings")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(state, "stored");
-
-        // S3成功後DB commit前で停止しても、同じkeyを照合して転送を繰り返さない。
+        // S3成功後ローカル解放前で停止しても、同じkeyを照合して転送を繰り返さない。
         let next = session.join(format!(
             "segment-{}.part",
             OffsetDateTime::now_utc().unix_timestamp() + 10
@@ -895,21 +844,148 @@ mod tests {
             segment.object_key,
             include_bytes!("../tests/fixtures/blue.mp4").to_vec(),
         );
-        assert!(
-            upload_one(root.path(), &pool, &config, &http)
-                .await
-                .unwrap()
-        );
+        assert!(upload_one(root.path(), &config, &http).await.unwrap());
         assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
         fs::write(session.join("segment-1.part"), b"interrupted").unwrap();
         recover(root.path(), "camera").await.unwrap();
         assert!(session.join("segment-1.corrupt").exists());
         assert_eq!(stats(root.path()).unwrap().2, 1);
         server.abort();
-        pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&admin)
-            .await
-            .unwrap();
+    }
+    fn fixture(session: &Path, epoch: i64) -> PathBuf {
+        let file = session.join(format!("segment-{epoch}.mp4"));
+        fs::write(&file, b"video fixture").unwrap();
+        let path = file.with_extension("json");
+        let start = OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+        atomic_json(
+            &path,
+            &Segment {
+                id: format!("fixture-{epoch}"),
+                camera_id: "camera".into(),
+                actual_start_at: start.format(&Rfc3339).unwrap(),
+                actual_end_at: (start + time::Duration::seconds(1))
+                    .format(&Rfc3339)
+                    .unwrap(),
+                file_name: file.file_name().unwrap().to_str().unwrap().into(),
+                object_key: format!("fixed/{epoch}.mp4"),
+                size: file.metadata().unwrap().len(),
+                checksum: checksum(&file).unwrap(),
+                attempts: 0,
+                next_attempt_at: 0,
+            },
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn invalid_manifests_do_not_block_upload_or_disappear_on_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session");
+        fs::create_dir(&session).unwrap();
+        let malformed = fixture(&session, 100);
+        fs::write(&malformed, b"{broken").unwrap();
+        let missing_field = fixture(&session, 101);
+        fs::write(&missing_field, b"{}").unwrap();
+        let invalid_time = fixture(&session, 102);
+        let mut value: Value = serde_json::from_reader(File::open(&invalid_time).unwrap()).unwrap();
+        value["actual_start_at"] = json!("not-a-date");
+        atomic_json(&invalid_time, &value).unwrap();
+        let normal = fixture(&session, 103);
+        // 旧manifestの追加フィールド省略を確認。
+        let mut legacy: Value = serde_json::from_reader(File::open(&normal).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("attempts");
+        legacy.as_object_mut().unwrap().remove("next_attempt_at");
+        atomic_json(&normal, &legacy).unwrap();
+        let before = stats(root.path()).unwrap();
+        assert_eq!(before.3, 3);
+        assert!(before.0 > 0 && before.1 > 0.0);
+        let mock = Mock::default();
+        let app = Router::new()
+            .route("/s3/head_object", post(head))
+            .route("/s3/put_object_stream", post(put))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vars = HashMap::from([
+            ("RTSP_URL".into(), "rtsp://unused".into()),
+            (
+                "API_HUB_BASE_URL".into(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            ),
+        ]);
+        let config = AppConfig::from_map(&vars).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        for _ in 0..2 {
+            recover(root.path(), "camera").await.unwrap();
+            upload_one(root.path(), &config, &http).await.unwrap();
+            for path in [&malformed, &missing_field, &invalid_time] {
+                assert!(path.exists() && path.with_extension("mp4").exists());
+            }
+            assert!(!normal.exists() && !normal.with_extension("mp4").exists());
+            assert_eq!(stats(root.path()).unwrap().3, 3);
+        }
+        assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
+        // manifestだけが残った削除途中はS3を照合し、再PUTせず解放。
+        let half_deleted = fixture(&session, 104);
+        let segment = read_segment(&half_deleted).unwrap();
+        mock.objects
+            .lock()
+            .unwrap()
+            .insert(segment.object_key, b"video fixture".to_vec());
+        fs::remove_file(half_deleted.with_extension("mp4")).unwrap();
+        upload_one(root.path(), &config, &http).await.unwrap();
+        assert!(!half_deleted.exists());
+        assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
+        // 両方欠損、remoteサイズ不一致、checksum不一致は保持。他の転送は進める。
+        let lost = fixture(&session, 105);
+        fs::remove_file(lost.with_extension("mp4")).unwrap();
+        let mismatch = fixture(&session, 106);
+        mock.objects
+            .lock()
+            .unwrap()
+            .insert("fixed/106.mp4".into(), vec![0]);
+        let changed = fixture(&session, 107);
+        fs::write(changed.with_extension("mp4"), b"changed").unwrap();
+        let good = fixture(&session, 108);
+        upload_one(root.path(), &config, &http).await.unwrap();
+        assert!(lost.exists() && mismatch.exists() && changed.exists());
+        assert!(!good.exists());
+        assert_eq!(mock.uploads.load(Ordering::SeqCst), 2);
+        for path in [&malformed, &missing_field, &invalid_time] {
+            fs::remove_file(path).unwrap();
+        }
+        assert_eq!(stats(root.path()).unwrap().3, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFMPEG_BIN"]
+    async fn stalled_rtsp_connection_times_out_on_each_reconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("rtsp://{}/fixture", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            loop {
+                connections.push(listener.accept().await.unwrap());
+            }
+        });
+        for _ in 0..2 {
+            let mut command = rtsp_command(&url, 500_000);
+            command
+                .args(["-f", "null", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let status = tokio::time::timeout(Duration::from_secs(8), command.status())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!status.success());
+        }
+        server.abort();
     }
 }

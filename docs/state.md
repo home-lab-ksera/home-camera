@@ -1,36 +1,13 @@
-# 常駐録画と再送
+# 永続録画
 
-`--record` はDBに依存せず録画し、`--upload` が完成segmentをcamera DBへ登録・送信する。`--migrate` はDB migrationのみ。
-引数なしは切替前の1回録画の動作を残す。
+`--record`はPVCへ連続segmentを確定し、`--upload`が別プロセスでS3へ送る。DB接続は不要。両プロセスはspoolのファイルロックで単一起動を守る。
 
-JST 19:00〜翌09:00に、1つのFFmpeg processでsegmentを連続生成する。
-SPOOL_DIRは既定/spool、SEGMENT_SECONDSは300（10〜900）、SPOOL_MAX_BYTESは80GiB。
-codec copyではkeyframe間隔により長さが変わる。CSVでclose済みと確認したsegmentをffprobeで確認し、実duration・サイズ・SHA-256とmanifestを確定する。
-segmentファイルを開いたUTC秒を開始、実durationから終了を記録する。
+完成mp4とjson manifestが未送信の正本。`.part`は録画中、`.corrupt`は要調査として保持する。既存manifest/keyをそのまま読み、追加のattempts/next_attempt_atは省略可能。再試行情報はatomic renameで保存する。
 
-spoolの上限または空き2GiB未満で録画を止め、未送信を自動削除しない。現在書き込み中のpartと完成mp4を区別し、起動時に回復する。
-回復できないpartはcorruptとして保持・監視する。spool上のfile lockでwriterを1つにする。
-PVC自体が利用不能な障害では録画できない。
+HEAD 404だけPUTへ進む。ローカルchecksumとS3の固定キー/サイズ照合に成功してから動画→manifestの順に解放する。S3サイズ照合はremote checksumの保証ではない。応答喪失や削除途中の停止は同じキーのHEADで回復する。両側欠損・サイズ不一致・認証失敗は保持する。
 
-uploaderはRTSP資格情報を持たず、app/verify-fullでDBへ接続する。pool上限2、migration1。
-各segmentの保存先は固定で、PUT後DB確定前に停止してもHEADで同じkeyとサイズを照合して回復する。claim一致で保存完了を確定した後だけspoolを削除する。
-SHA-256はspoolの不変性確認に使う。S3側のサイズ確認をremote checksum検証と同一視しない。
-DB/S3障害中はファイルを保持して再試行する。
+壊れたJSON・日時・必須項目はmanifest単位で隔離し、動画も保持する。キーを推測して再生成しない。正常ファイルの転送は続け、home_camera_invalid_manifestsで異常件数を監視する。正常manifestの最古時刻と保持動画の容量も集計する。
 
-recorderの9090にhealth/metricsを提供し、spool bytes、最古未送信の経過時間、容量停止、録画中、不完全segment、FFmpeg再起動回数を公開する。
-RTSP URLはログへ出さず、Kubernetes Secretを参照する。
+録画時間はJST 19:00〜翌09:00。spool上限・空き容量不足時は未送信を消さず停止する。RTSP接続は30秒timeout、完成segmentがsegment長の2倍+60秒停止すると再接続しhome_camera_recording_stalledで知らせる。プロセス生存だけを録画成功としない。
 
-```bash
-cargo test --locked
-FFMPEG_BIN=/usr/bin/ffmpeg FFPROBE_BIN=/usr/bin/ffprobe \
-TEST_DATABASE_URL=postgres://.../isolated_test \
-cargo test --locked --lib persistent::tests -- --ignored
-```
-
-テスト映像は人工的な青一色のMP4。連続segment生成、DB/S3停止、PUT後DB確定前停止、不完全segment回復を隔離環境で検証する。
-[旧CronJobからの切替](../../k8s_myHome/docs/application-postgresql-cutover.md)は旧writerの停止確認後に行う。
-
-spoolの集計はuploaderと並行するため、走査中に削除されたファイル・sessionを除外する。
-その他の集計エラーでは直近の集計値を保持して録画ループを継続し、
-`home_camera_spool_stats_success=0`を公開する。次の集計成功で1へ戻る。
-この値が0の間は容量・最古滞留時間の値が古い可能性がある。空き容量の確認と録画の容量制限は継続する。
+旧DBは退役履歴として保持し、SQLx migration履歴は変更しない。旧imageへ戻す際はwriter/uploaderを終了して交代し、旧DBの履歴とS3保存済みの差分を確認する。
