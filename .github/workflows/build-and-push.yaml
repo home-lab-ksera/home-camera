@@ -19,6 +19,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  recovery-tests:
+    uses: ./.github/workflows/state-tests.yml
+
   build-image:
     runs-on: ubuntu-latest
 
@@ -44,7 +47,7 @@ jobs:
 
   push-image:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    needs: build-image
+    needs: [build-image, recovery-tests]
     runs-on: home-camera-runners  # self-hosted runner
 
     steps:
