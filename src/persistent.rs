@@ -62,22 +62,19 @@ fn read_segment(path: &Path) -> Result<Segment> {
     Ok(segment)
 }
 
-pub async fn dispatch() -> Result<bool> {
-    let mode = env::args().nth(1).unwrap_or_default();
-    if mode.is_empty() {
-        return Ok(false);
+pub async fn dispatch() -> Result<()> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if args.len() != 1 {
+        bail!("Usage: home-camera --record|--upload");
     }
-    match mode.as_str() {
-        "--migrate" => {
-            // 切替前のGitOps migration Jobとの互換。DBは変更しない（P6で撤去）。
-            eprintln!("camera no longer requires database migrations");
-        }
+    match args[0].as_str() {
         "--record" => recorder().await?,
         "--upload" => uploader().await?,
-        _ => bail!("Usage: home-camera [--migrate|--record|--upload]"),
+        _ => bail!("Usage: home-camera --record|--upload"),
     }
-    Ok(true)
+    Ok(())
 }
+
 fn root() -> PathBuf {
     env::var_os("SPOOL_DIR")
         .map(PathBuf::from)

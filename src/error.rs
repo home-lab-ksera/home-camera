@@ -8,18 +8,6 @@ pub enum AppError {
     #[error("invalid environment variable {name}: {reason}")]
     InvalidEnv { name: &'static str, reason: String },
 
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("time error: {0}")]
-    Time(#[from] time::error::ComponentRange),
-
-    #[error("uri parse error: {0}")]
-    Uri(String),
-
     #[error("s3 upload error: {0}")]
     S3Upload(String),
-
-    #[error("recording failed: {0}")]
-    Recording(String),
 }

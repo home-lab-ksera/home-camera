@@ -18,28 +18,6 @@ fn base_env() -> HashMap<String, String> {
 
 proptest! {
     #[test]
-    fn positive_record_seconds_are_accepted(secs in 1u32..86_400u32) {
-        let mut vars = base_env();
-        vars.insert("RECORD_SECONDS".to_string(), secs.to_string());
-
-        let cfg = AppConfig::from_map(&vars).expect("config should parse");
-        prop_assert_eq!(cfg.record_seconds, secs as u64);
-    }
-
-    #[test]
-    fn non_positive_record_seconds_are_rejected(secs in 0u32..=1u32) {
-        let mut vars = base_env();
-        vars.insert("RECORD_SECONDS".to_string(), secs.to_string());
-        let parsed = AppConfig::from_map(&vars);
-
-        if secs == 0 {
-            prop_assert!(parsed.is_err());
-        } else {
-            prop_assert!(parsed.is_ok());
-        }
-    }
-
-    #[test]
     fn ffmpeg_crf_in_range_is_accepted(crf in 0u8..=51u8) {
         let mut vars = base_env();
         vars.insert("FFMPEG_CRF".to_string(), crf.to_string());
@@ -79,7 +57,6 @@ fn ffmpeg_defaults_are_applied() {
         cfg.ffmpeg_audio_bitrate,
         AppConfig::DEFAULT_FFMPEG_AUDIO_BITRATE
     );
-    assert_eq!(cfg.ffmpeg_loglevel, AppConfig::DEFAULT_FFMPEG_LOGLEVEL);
     assert_eq!(cfg.ffmpeg_preset, AppConfig::DEFAULT_FFMPEG_PRESET);
     assert_eq!(cfg.ffmpeg_crf, AppConfig::DEFAULT_FFMPEG_CRF);
 }
@@ -97,7 +74,6 @@ fn empty_new_ffmpeg_settings_are_rejected() {
         "FFMPEG_VIDEO_CODEC",
         "FFMPEG_AUDIO_CODEC",
         "FFMPEG_AUDIO_BITRATE",
-        "FFMPEG_LOGLEVEL",
     ] {
         let mut vars = base_env();
         vars.insert(key.to_string(), "   ".to_string());

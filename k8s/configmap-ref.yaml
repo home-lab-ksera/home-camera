@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: sandbox-connection-info
-  namespace: sandbox
-data:
-  API_HUB_BASE_URL: http://api-hub.sandbox.svc:3000
