@@ -8,6 +8,6 @@ HEAD 404だけPUTへ進む。ローカルchecksumとS3の固定キー/サイズ�
 
 壊れたJSON・日時・必須項目はmanifest単位で隔離し、動画も保持する。キーを推測して再生成しない。正常ファイルの転送は続け、home_camera_invalid_manifestsで異常件数を監視する。正常manifestの最古時刻と保持動画の容量も集計する。
 
-録画時間はJST 19:00〜翌09:00。spool上限・空き容量不足時は未送信を消さず停止する。RTSP接続は30秒timeout、完成segmentがsegment長の2倍+60秒停止すると再接続しhome_camera_recording_stalledで知らせる。プロセス生存だけを録画成功としない。
+録画時間はJST 19:00〜翌09:00。spool上限・空き容量不足時は未送信を消さず停止する。RTSP接続は30秒timeout、各FFmpegで完成segmentがsegment長の2倍+60秒停止すると再接続する。録画監視も同じ猶予を使うが、再接続ではリセットせずhome_camera_recording_stalledで知らせる。正常なsegment確定で復旧とし、確定に失敗したファイルは進捗に数えない。時間帯外・容量停止中は猶予を解除し、録画再開時から測り直す。プロセス生存だけを録画成功としない。
 
 旧DBは退役履歴として保持し、SQLx migration履歴は変更しない。旧imageへ戻す際はwriter/uploaderを終了して交代し、旧DBの履歴とS3保存済みの差分を確認する。
