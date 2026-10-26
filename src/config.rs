@@ -8,11 +8,9 @@ pub struct AppConfig {
     pub api_hub_base_url: String,
     pub s3_bucket: String,
     pub camera_id: String,
-    pub record_seconds: u64,
     pub ffmpeg_video_codec: String,
     pub ffmpeg_audio_codec: String,
     pub ffmpeg_audio_bitrate: String,
-    pub ffmpeg_loglevel: String,
     pub ffmpeg_preset: String,
     pub ffmpeg_crf: u8,
 }
@@ -20,11 +18,9 @@ pub struct AppConfig {
 impl AppConfig {
     pub const DEFAULT_BUCKET: &'static str = "home-camera-recordings";
     pub const DEFAULT_CAMERA_ID: &'static str = "camera";
-    pub const DEFAULT_RECORD_SECONDS: u64 = 3600;
     pub const DEFAULT_FFMPEG_VIDEO_CODEC: &'static str = "copy";
     pub const DEFAULT_FFMPEG_AUDIO_CODEC: &'static str = "copy";
     pub const DEFAULT_FFMPEG_AUDIO_BITRATE: &'static str = "128k";
-    pub const DEFAULT_FFMPEG_LOGLEVEL: &'static str = "warning";
     pub const DEFAULT_FFMPEG_PRESET: &'static str = "veryfast";
     pub const DEFAULT_FFMPEG_CRF: u8 = 23;
 
@@ -70,23 +66,6 @@ impl AppConfig {
             .cloned()
             .unwrap_or_else(|| Self::DEFAULT_CAMERA_ID.to_string());
 
-        let record_seconds = match vars.get("RECORD_SECONDS") {
-            Some(v) => {
-                let parsed = v.parse::<u64>().map_err(|_| AppError::InvalidEnv {
-                    name: "RECORD_SECONDS",
-                    reason: "must be an integer".to_string(),
-                })?;
-                if parsed == 0 {
-                    return Err(AppError::InvalidEnv {
-                        name: "RECORD_SECONDS",
-                        reason: "must be > 0".to_string(),
-                    });
-                }
-                parsed
-            }
-            None => Self::DEFAULT_RECORD_SECONDS,
-        };
-
         let ffmpeg_video_codec = vars
             .get("FFMPEG_VIDEO_CODEC")
             .cloned()
@@ -116,17 +95,6 @@ impl AppConfig {
         if ffmpeg_audio_bitrate.trim().is_empty() {
             return Err(AppError::InvalidEnv {
                 name: "FFMPEG_AUDIO_BITRATE",
-                reason: "must not be empty".to_string(),
-            });
-        }
-
-        let ffmpeg_loglevel = vars
-            .get("FFMPEG_LOGLEVEL")
-            .cloned()
-            .unwrap_or_else(|| Self::DEFAULT_FFMPEG_LOGLEVEL.to_string());
-        if ffmpeg_loglevel.trim().is_empty() {
-            return Err(AppError::InvalidEnv {
-                name: "FFMPEG_LOGLEVEL",
                 reason: "must not be empty".to_string(),
             });
         }
@@ -164,11 +132,9 @@ impl AppConfig {
             api_hub_base_url,
             s3_bucket,
             camera_id,
-            record_seconds,
             ffmpeg_video_codec,
             ffmpeg_audio_codec,
             ffmpeg_audio_bitrate,
-            ffmpeg_loglevel,
             ffmpeg_preset,
             ffmpeg_crf,
         })

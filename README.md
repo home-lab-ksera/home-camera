@@ -1,72 +1,21 @@
 # home-camera
 
-Batch app for hourly RTSP recording and upload to RustFS (S3-compatible storage).
+JST 19:00〜翌09:00にRTSPを連続segment録画し、永続spoolからS3へ送る。DB接続は不要。
 
+- `home-camera --record`: recorder.lockを取得し、完成mp4/manifestをPVCへ確定する。
+- `home-camera --upload`: uploader.lockを取得し、固定キーのHEAD/PUT確認後にspoolを解放する。
 
-## What it does
+同じspoolをmountする別プロセスで実行する。引数なし・旧migration・誤った引数は失敗する。破損segment/manifestは保持し、容量不足時は未送信を消さず録画を停止する。[回復と監視](docs/state.md)を参照。
 
-- Connects to an RTSP camera URL from `RTSP_URL`
-- Records stream for `RECORD_SECONDS` (default: 3600) using ffmpeg
-- Creates MP4 file locally
-- Streams MP4 to api-hub (`POST /s3/put_object_stream?bucket=...&key=...`), which uploads to RustFS
-- Uses object key format: `camera/YYYY/MM/DD/HH.mp4` (JST)
+必須設定はrecorderの`RTSP_URL`と`API_HUB_BASE_URL`。uploaderにRTSP資格情報は不要。S3資格情報はapi-hubが持つ。`SPOOL_DIR`は既定`/spool`、`SEGMENT_SECONDS`は300秒（10〜900）、`SPOOL_MAX_BYTES`は80GiB。
 
-## Required environment variables
+`S3_BUCKET`はhome-camera-recordings、`CAMERA_ID`はcamera。codecは`FFMPEG_VIDEO_CODEC`/`FFMPEG_AUDIO_CODEC`が既定copy。audio bitrateは128k。libx264使用時は`FFMPEG_PRESET`（veryfast）と`FFMPEG_CRF`（23、0〜51）を使う。
 
-- `RTSP_URL`
-- `API_HUB_BASE_URL` (e.g. `http://api-hub.sandbox.svc:3000`)
-
-S3 credentials and endpoint configuration belong to api-hub; home-camera does not need them.
-Uploads are streamed from disk so recording size does not determine memory usage.
-
-## Optional environment variables
-
-- `S3_BUCKET` (default: `home-camera-recordings`)
-- `CAMERA_ID` (default: `camera`)
-- `RECORD_SECONDS` (default: `3600`)
-- `FFMPEG_VIDEO_CODEC` (default: `copy`)
-- `FFMPEG_AUDIO_CODEC` (default: `copy`)
-- `FFMPEG_AUDIO_BITRATE` (default: `128k`)
-- `FFMPEG_LOGLEVEL` (default: `warning`)
-- `FFMPEG_PRESET` (default: `veryfast`)
-- `FFMPEG_CRF` (default: `23`, range: `0..=51`)
-
-Notes:
-
-- Default pipeline favors stability and quality (`copy` video + `copy` audio)
-- `FFMPEG_PRESET` and `FFMPEG_CRF` are only used when `FFMPEG_VIDEO_CODEC=libx264`
-
-## Local run
+本番のStatefulSet/PVC/Secret参照は`k8s_myHome/manifests/apps/home-camera/`が正本。旧CronJobのstandalone exampleは廃止した。
 
 ```bash
-cargo run --release
+cargo test --locked
+FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe cargo test --locked --lib persistent::tests -- --ignored
 ```
 
-## Tests (PBT-first)
-
-```bash
-cargo test
-```
-
-Property-based tests cover:
-
-- S3 key generation shape and camera id sanitization
-- Config parsing constraints
-- Retry backoff monotonicity and upper cap
-
-## Kubernetes
-
-- CronJob manifest: `k8s/cronjob.yaml`
-- Optional ConfigMap example: `k8s/configmap-ref.yaml` (the CronJob sets `API_HUB_BASE_URL` directly)
-- Secret template: `k8s/secret.example.yaml`
-
-Production manifests are managed in `k8s_myHome/manifests/apps/home-camera/`.
-Deploy an api-hub version supporting `/s3/put_object_stream` before rolling out home-camera.
-
-For a standalone example, apply in order:
-
-```bash
-kubectl apply -f k8s/configmap-ref.yaml
-kubectl apply -f k8s/secret.example.yaml
-kubectl apply -f k8s/cronjob.yaml
-```
+回復試験は人工映像と模擬HTTP/RTSPを使い、DB設定なしで実行する。
