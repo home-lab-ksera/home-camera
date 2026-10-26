@@ -209,7 +209,8 @@ async fn finish(path: &Path, camera: &str) -> Result<()> {
     Ok(())
 }
 
-async fn recover(root: &Path, camera: &str) -> Result<()> {
+async fn recover(root: &Path, camera: &str) -> Result<u64> {
+    let mut completed = 0;
     for session in sessions(root)? {
         for entry in fs::read_dir(&session)? {
             let path = entry?.path();
@@ -218,10 +219,13 @@ async fn recover(root: &Path, camera: &str) -> Result<()> {
             {
                 continue;
             }
-            if let Err(error) = finish(&path, camera).await {
-                eprintln!("camera segment could not be recovered: {error}");
-                if path.extension().is_some_and(|v| v == "part") {
-                    fs::rename(&path, path.with_extension("corrupt"))?;
+            match finish(&path, camera).await {
+                Ok(()) => completed += 1,
+                Err(error) => {
+                    eprintln!("camera segment could not be recovered: {error}");
+                    if path.extension().is_some_and(|v| v == "part") {
+                        fs::rename(&path, path.with_extension("corrupt"))?;
+                    }
                 }
             }
         }
@@ -229,7 +233,35 @@ async fn recover(root: &Path, camera: &str) -> Result<()> {
             fs::remove_file(session.join(".active"))?;
         }
     }
-    Ok(())
+    Ok(completed)
+}
+
+#[derive(Default)]
+struct RecordingProgress {
+    // 録画開始の猶予、または最後に正常確定したsegmentからの経過時間。
+    // FFmpegの再起動では更新しない。
+    since: Option<Instant>,
+}
+
+impl RecordingProgress {
+    fn observe(&mut self, active_time: bool, blocked: bool, now: Instant) {
+        if active_time && !blocked {
+            self.since.get_or_insert(now);
+        } else {
+            self.since = None;
+        }
+    }
+
+    fn completed(&mut self, now: Instant) {
+        if self.since.is_some() {
+            self.since = Some(now);
+        }
+    }
+
+    fn stalled(&self, now: Instant, deadline: Duration) -> bool {
+        self.since
+            .is_some_and(|since| now.duration_since(since) > deadline)
+    }
 }
 
 #[derive(Default)]
@@ -359,7 +391,9 @@ async fn recorder() -> Result<()> {
     let mut child: Option<(Child, PathBuf)> = None;
     let mut next_start = Instant::now();
     let mut sampled = (0, 0.0, 0, 0);
-    let mut last_progress = Instant::now();
+    let mut process_progress = Instant::now();
+    let mut recording_progress = RecordingProgress::default();
+    let progress_deadline = Duration::from_secs(seconds * 2 + 60);
     let mut next_sample = Instant::now();
     loop {
         if Instant::now() >= next_sample {
@@ -379,9 +413,7 @@ async fn recorder() -> Result<()> {
         let (bytes, age, partial, invalid) = sampled;
         let blocked = bytes >= max || fs2::available_space(&root)? < 2 * 1024 * 1024 * 1024;
         let active_time = allowed(OffsetDateTime::now_utc());
-        if !active_time {
-            metrics.lock().unwrap().stalled = false;
-        }
+        recording_progress.observe(active_time, blocked, Instant::now());
         {
             let mut v = metrics.lock().unwrap();
             v.bytes = bytes;
@@ -448,7 +480,7 @@ async fn recorder() -> Result<()> {
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
             child = Some((command.spawn().context("could not start ffmpeg")?, session));
-            last_progress = Instant::now();
+            process_progress = Instant::now();
         }
         if let Some((process, session)) = &mut child {
             // muxerが閉じたファイルだけをCSVから確定する。現在書き込み中のpartは送らない。
@@ -457,11 +489,15 @@ async fn recorder() -> Result<()> {
                     if let Some(name) = line.split(',').next() {
                         let path = session.join(name.trim_matches('"'));
                         if path.exists() && path.extension().is_some_and(|v| v == "part") {
-                            last_progress = Instant::now();
-                            metrics.lock().unwrap().stalled = false;
-                            if let Err(error) = finish(&path, &config.camera_id).await {
-                                eprintln!("closed segment could not be finalized: {error}");
-                                fs::rename(&path, path.with_extension("corrupt"))?;
+                            match finish(&path, &config.camera_id).await {
+                                Ok(()) => {
+                                    process_progress = Instant::now();
+                                    recording_progress.completed(process_progress);
+                                }
+                                Err(error) => {
+                                    eprintln!("closed segment could not be finalized: {error}");
+                                    fs::rename(&path, path.with_extension("corrupt"))?;
+                                }
                             }
                         }
                     }
@@ -469,18 +505,19 @@ async fn recorder() -> Result<()> {
             }
             let exited = process.try_wait()?.is_some();
             // 接続猶予60秒とkeyframe境界の余裕を含め、完成segmentの停止を検知する。
-            let stalled = last_progress.elapsed() > Duration::from_secs(seconds * 2 + 60);
-            if stalled {
-                metrics.lock().unwrap().stalled = true;
-            }
+            let stalled = process_progress.elapsed() > progress_deadline;
             if exited || stalled || !active_time || blocked {
                 stop(process).await;
                 child = None;
-                recover(&root, &config.camera_id).await?;
+                if recover(&root, &config.camera_id).await? > 0 {
+                    recording_progress.completed(Instant::now());
+                }
                 next_start = Instant::now() + Duration::from_secs(10);
                 metrics.lock().unwrap().restarts += u64::from(exited || stalled);
             }
         }
+        metrics.lock().unwrap().stalled =
+            recording_progress.stalled(Instant::now(), progress_deadline);
         tokio::select! {_=terminate.recv()=>break,_=interrupt.recv()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
     }
     if let Some((mut process, _)) = child {
@@ -611,6 +648,44 @@ mod tests {
         routing::post,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn recording_deadline_survives_reconnects_until_a_segment_completes() {
+        let start = Instant::now();
+        let deadline = Duration::from_secs(80);
+        let mut progress = RecordingProgress::default();
+        // 10秒おきの再接続でも録画成功の時計は進み続ける。
+        for seconds in (0..=100).step_by(10) {
+            let now = start + Duration::from_secs(seconds);
+            progress.observe(true, false, now);
+            assert_eq!(progress.stalled(now, deadline), seconds > 80);
+        }
+        let completed = start + Duration::from_secs(101);
+        progress.completed(completed);
+        assert!(!progress.stalled(completed, deadline));
+        assert!(!progress.stalled(completed + deadline, deadline));
+        assert!(progress.stalled(completed + deadline + Duration::from_secs(1), deadline));
+    }
+
+    #[test]
+    fn recording_window_and_capacity_stop_give_a_new_startup_grace() {
+        let start = Instant::now();
+        let deadline = Duration::from_secs(80);
+        for (active_time, blocked) in [(false, false), (true, true)] {
+            let mut progress = RecordingProgress::default();
+            progress.observe(true, false, start);
+            assert!(progress.stalled(start + Duration::from_secs(100), deadline));
+            progress.observe(active_time, blocked, start + Duration::from_secs(101));
+            assert!(!progress.stalled(start + Duration::from_secs(1000), deadline));
+            // 停止時の回収segmentで、時間帯外の監視を再開しない。
+            progress.completed(start + Duration::from_secs(1000));
+            assert!(progress.since.is_none());
+            let resumed = start + Duration::from_secs(2000);
+            progress.observe(true, false, resumed);
+            assert!(!progress.stalled(resumed + deadline, deadline));
+            assert!(progress.stalled(resumed + deadline + Duration::from_secs(1), deadline));
+        }
+    }
 
     #[test]
     fn recording_window_crosses_midnight_in_jst() {
