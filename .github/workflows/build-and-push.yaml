@@ -48,7 +48,7 @@ jobs:
   push-image:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [build-image, recovery-tests]
-    runs-on: home-camera-runners  # self-hosted runner
+    runs-on: harbor-publish-runners  # self-hosted runner
     concurrency:
       group: harbor-publish-${{ github.repository }}-home-camera
       cancel-in-progress: false
