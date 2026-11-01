@@ -373,10 +373,10 @@ async fn recorder() -> Result<()> {
     let _lock = lock(&root, "recorder.lock")?;
     recover(&root, &config.camera_id).await?;
     let seconds: u64 = env::var("SEGMENT_SECONDS")
-        .unwrap_or_else(|_| "300".into())
+        .unwrap_or_else(|_| "3600".into())
         .parse()?;
-    if !(10..=900).contains(&seconds) {
-        bail!("SEGMENT_SECONDS must be 10..900");
+    if !(10..=3600).contains(&seconds) {
+        bail!("SEGMENT_SECONDS must be 10..3600");
     }
     let max: u64 = env::var("SPOOL_MAX_BYTES")
         .unwrap_or_else(|_| "85899345920".into())
