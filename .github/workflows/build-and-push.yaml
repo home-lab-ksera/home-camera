@@ -38,11 +38,26 @@ jobs:
       run: |
         docker save home-camera:ci | gzip > /tmp/home-camera-image.tar.gz
 
+    - name: Download verified crane tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        for ARCH in x86_64 arm64; do
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 30 \
+            "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_$ARCH.tar.gz" \
+            -o "/tmp/crane-$ARCH.tar.gz"
+        done
+        echo "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  /tmp/crane-x86_64.tar.gz" | sha256sum --check
+        echo "898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110  /tmp/crane-arm64.tar.gz" | sha256sum --check
+
     - name: Upload image artifact
       uses: actions/upload-artifact@v4
       with:
         name: home-camera-image
-        path: /tmp/home-camera-image.tar.gz
+        path: |
+          /tmp/home-camera-image.tar.gz
+          /tmp/crane-x86_64.tar.gz
+          /tmp/crane-arm64.tar.gz
         retention-days: 1
 
   push-image:
@@ -70,9 +85,7 @@ jobs:
           *) echo "Unsupported architecture" >&2; exit 1 ;;
         esac
         mkdir -p "$RUNNER_TEMP/crane-bin"
-        curl --fail --silent --show-error --location \
-          "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_$ARCH.tar.gz" \
-          -o "$RUNNER_TEMP/crane.tar.gz"
+        cp "/tmp/crane-$ARCH.tar.gz" "$RUNNER_TEMP/crane.tar.gz"
         echo "$SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum --check
         tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
 
@@ -120,4 +133,4 @@ jobs:
       shell: bash
       run: |
         rm -rf "$RUNNER_TEMP/harbor-auth" "$RUNNER_TEMP/crane-bin"
-        rm -f "$RUNNER_TEMP/crane.tar.gz" "$RUNNER_TEMP/image.tar" /tmp/home-camera-image.tar.gz
+        rm -f "$RUNNER_TEMP/crane.tar.gz" "$RUNNER_TEMP/image.tar" /tmp/home-camera-image.tar.gz /tmp/crane-x86_64.tar.gz /tmp/crane-arm64.tar.gz
