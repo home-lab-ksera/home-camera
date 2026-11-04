@@ -4,6 +4,12 @@
 
 完成mp4とjson manifestが未送信の正本。`.part`は録画中、`.corrupt`は要調査として保持する。既存manifest/keyをそのまま読み、追加のattempts/next_attempt_atは省略可能。再試行情報はatomic renameで保存する。
 
+新規segment名は`segment-<session開始epoch>-<9桁連番>.part`。同一秒に複数segmentが生成されても上書きしない。開始時刻はsession開始UTCとCSVのメディア時刻から求め、S3キーにも連番を含める。CSVの改行済み行だけを完成通知として扱い、重複名・不正なパス・時刻は拒否する。旧形式のepochだけの名前と既存manifestも回収・送信できる。
+
+FFmpegのエラーと再接続理由はrecorderログへ記録する。RTSP URL・パスワードは伏せ、ffprobeの検査失敗には原因を添える。入力側の時刻跳躍はファイル名の一意性に影響しないが、メディア時刻由来の開始・終了表示には影響し得る。
+
+調査済みの破損ファイルを保全する場合は、原本・CSV・checksum・調査理由を別途バックアップしてからsessionを`/spool/.quarantine/<incident>/`へ移す。このディレクトリは自動回収・送信・未確認segment数・送信待ち容量の対象外で、ファイルは削除されない。PVC全体の空き容量チェックには引き続き影響する。原因調査前の自動隔離や一括清掃には使わない。
+
 HEAD 404だけPUTへ進む。ローカルchecksumとS3の固定キー/サイズ照合に成功してから動画→manifestの順に解放する。S3サイズ照合はremote checksumの保証ではない。応答喪失や削除途中の停止は同じキーのHEADで回復する。両側欠損・サイズ不一致・認証失敗は保持する。
 
 壊れたJSON・日時・必須項目はmanifest単位で隔離し、動画も保持する。キーを推測して再生成しない。正常ファイルの転送は続け、home_camera_invalid_manifestsで異常件数を監視する。正常manifestの最古時刻と保持動画の容量も集計する。

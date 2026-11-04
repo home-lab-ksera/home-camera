@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fs::{self, File},
     io::Read,
@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -117,6 +118,8 @@ fn sessions(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(fs::read_dir(root)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        // 調査済みの原本保全用。自動で隔離・削除・再送はしない。
+        .filter(|entry| entry.file_name() != ".quarantine")
         .map(|entry| entry.path())
         .collect())
 }
@@ -133,17 +136,83 @@ fn manifests(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-async fn finish(path: &Path, camera: &str) -> Result<()> {
+struct ClosedSegment {
+    name: String,
+    start: f64,
+    end: f64,
+}
+
+// CSVの末尾はFFmpegが追記中かもしれない。改行まで書かれた行だけを扱う。
+fn closed_segments(session: &Path) -> Result<Vec<ClosedSegment>> {
+    let Some(csv) = present(fs::read_to_string(session.join("segments.csv")))? else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    let mut names = HashSet::new();
+    for line in csv
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
+        let fields: Vec<_> = line.trim().split(',').collect();
+        if fields.len() != 3 {
+            bail!("invalid closed segment CSV row");
+        }
+        let name = fields[0].trim_matches('"');
+        if !name.starts_with("segment-")
+            || !name.ends_with(".part")
+            || Path::new(name).file_name().and_then(|v| v.to_str()) != Some(name)
+            || !names.insert(name.to_owned())
+        {
+            bail!("unsafe or repeated closed segment filename");
+        }
+        let start = fields[1].parse::<f64>()?;
+        let end = fields[2].parse::<f64>()?;
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start || end > 86400.0 {
+            bail!("invalid closed segment timestamps");
+        }
+        result.push(ClosedSegment {
+            name: name.into(),
+            start,
+            end,
+        });
+    }
+    Ok(result)
+}
+
+fn segment_start(path: &Path) -> Result<(OffsetDateTime, String)> {
     let stem = path
         .file_stem()
         .context("segment filename missing")?
         .to_str()
         .context("invalid segment filename")?;
-    let epoch = stem
+    let identity = stem
         .strip_prefix("segment-")
-        .context("invalid segment filename")?
-        .parse::<i64>()?;
-    let start = OffsetDateTime::from_unix_timestamp(epoch)?;
+        .context("invalid segment filename")?;
+    let (epoch, sequence) = match identity.split_once('-') {
+        Some((epoch, sequence)) => (epoch.parse::<i64>()?, Some(sequence.parse::<usize>()?)),
+        None => (identity.parse::<i64>()?, None), // 既存spoolの時刻だけの名前も回収できる。
+    };
+    let mut start = OffsetDateTime::from_unix_timestamp(epoch)?;
+    if let Some(sequence) = sequence {
+        let rows = closed_segments(path.parent().context("session directory missing")?)?;
+        let offset = if let Some(row) = rows.get(sequence) {
+            if row.name != format!("{stem}.part") {
+                bail!("segment sequence does not match CSV");
+            }
+            row.start
+        } else if sequence == rows.len() {
+            // 停止時にCSVへ登録されなかった最後のpart。ffprobe成功時だけ回収する。
+            rows.last().map_or(0.0, |row| row.end)
+        } else {
+            bail!("segment start timestamp missing");
+        };
+        start += time::Duration::milliseconds((offset * 1000.0) as i64);
+    }
+    Ok((start, identity.to_owned()))
+}
+
+async fn finish(path: &Path, camera: &str) -> Result<()> {
+    let (start, identity) = segment_start(path)?;
     let probe = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new(env::var("FFPROBE_BIN").unwrap_or_else(|_| "ffprobe".into()))
@@ -156,13 +225,18 @@ async fn finish(path: &Path, camera: &str) -> Result<()> {
                 "json",
             ])
             .arg(path)
-            .stderr(Stdio::null())
             .kill_on_drop(true)
             .output(),
     )
     .await??;
     if !probe.status.success() {
-        bail!("segment is incomplete");
+        bail!(
+            "segment is incomplete: {}",
+            String::from_utf8_lossy(&probe.stderr)
+                .chars()
+                .take(2048)
+                .collect::<String>()
+        );
     }
     let value: Value = serde_json::from_slice(&probe.stdout)?;
     let duration = value["format"]["duration"]
@@ -189,16 +263,20 @@ async fn finish(path: &Path, camera: &str) -> Result<()> {
     }
     let camera = sanitize_camera_id(camera);
     let segment = Segment {
-        id: format!("{session}-{epoch}"),
+        id: format!("{session}-{identity}"),
         camera_id: camera.clone(),
         actual_start_at: start.format(&Rfc3339)?,
         actual_end_at: end.format(&Rfc3339)?,
         file_name: mp4.file_name().unwrap().to_str().unwrap().into(),
         object_key: format!(
-            "{camera}/{:04}/{:02}/{:02}/{epoch}-{session}.mp4",
+            "{camera}/{:04}/{:02}/{:02}/{}-{session}{}.mp4",
             start.year(),
             start.month() as u8,
-            start.day()
+            start.day(),
+            start.unix_timestamp(),
+            identity
+                .split_once('-')
+                .map_or(String::new(), |(_, sequence)| format!("-{sequence}")),
         ),
         size: metadata.len(),
         checksum: checksum(&mp4)?,
@@ -367,6 +445,40 @@ fn rtsp_command(url: &str, timeout_us: u64) -> Command {
     command
 }
 
+fn segment_output(command: &mut Command, session: &Path, epoch: i64, seconds: u64) {
+    command
+        .args([
+            "-f",
+            "segment",
+            "-segment_time",
+            &seconds.to_string(),
+            "-reset_timestamps",
+            "1",
+            "-segment_format",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+faststart",
+            "-segment_list_type",
+            "csv",
+            "-segment_list_size",
+            "0",
+            "-segment_list",
+        ])
+        .arg(session.join("segments.csv"))
+        // 秒単位のstrftime名は、入力時刻の跳躍・バッファ放出で衝突する。
+        .arg(session.join(format!("segment-{epoch}-%09d.part")));
+}
+
+fn redact_ffmpeg(line: &str, rtsp_url: &str) -> String {
+    let mut line = line.replace(rtsp_url, "[RTSP URL]");
+    if let Ok(url) = reqwest::Url::parse(rtsp_url) {
+        if let Some(password) = url.password().filter(|value| !value.is_empty()) {
+            line = line.replace(password, "[REDACTED]");
+        }
+    }
+    line.chars().take(2048).collect()
+}
+
 async fn recorder() -> Result<()> {
     let config = AppConfig::from_env()?;
     let root = root();
@@ -452,42 +564,35 @@ async fn recorder() -> Result<()> {
             if config.ffmpeg_audio_codec != "copy" {
                 command.args(["-b:a", &config.ffmpeg_audio_bitrate]);
             }
+            segment_output(
+                &mut command,
+                &session,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                seconds,
+            );
             command
-                .args([
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    &seconds.to_string(),
-                    "-reset_timestamps",
-                    "1",
-                    "-strftime",
-                    "1",
-                    "-segment_format",
-                    "mp4",
-                    "-segment_format_options",
-                    "movflags=+faststart",
-                    "-segment_list_type",
-                    "csv",
-                    "-segment_list_size",
-                    "0",
-                    "-segment_list",
-                ])
-                .arg(session.join("segments.csv"))
-                .arg(session.join("segment-%s.part"))
-                .env("TZ", "UTC")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            child = Some((command.spawn().context("could not start ffmpeg")?, session));
+            let mut process = command.spawn().context("could not start ffmpeg")?;
+            let stderr = process.stderr.take().context("ffmpeg stderr missing")?;
+            let rtsp_url = config.rtsp_url.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("camera ffmpeg: {}", redact_ffmpeg(&line, &rtsp_url));
+                }
+            });
+            child = Some((process, session));
             process_progress = Instant::now();
         }
         if let Some((process, session)) = &mut child {
             // muxerが閉じたファイルだけをCSVから確定する。現在書き込み中のpartは送らない。
-            if let Ok(csv) = fs::read_to_string(session.join("segments.csv")) {
-                for line in csv.lines() {
-                    if let Some(name) = line.split(',').next() {
-                        let path = session.join(name.trim_matches('"'));
+            match closed_segments(session) {
+                Ok(rows) => {
+                    for row in rows {
+                        let path = session.join(row.name);
                         if path.exists() && path.extension().is_some_and(|v| v == "part") {
                             match finish(&path, &config.camera_id).await {
                                 Ok(()) => {
@@ -495,18 +600,31 @@ async fn recorder() -> Result<()> {
                                     recording_progress.completed(process_progress);
                                 }
                                 Err(error) => {
-                                    eprintln!("closed segment could not be finalized: {error}");
-                                    fs::rename(&path, path.with_extension("corrupt"))?;
+                                    eprintln!(
+                                        "closed segment {} could not be finalized: {error}",
+                                        path.display()
+                                    );
+                                    if path.exists() {
+                                        fs::rename(&path, path.with_extension("corrupt"))?;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                Err(error) => eprintln!("camera closed segment list rejected: {error}"),
             }
-            let exited = process.try_wait()?.is_some();
+            let status = process.try_wait()?;
+            let exited = status.is_some();
             // 接続猶予60秒とkeyframe境界の余裕を含め、完成segmentの停止を検知する。
             let stalled = process_progress.elapsed() > progress_deadline;
             if exited || stalled || !active_time || blocked {
+                if exited || stalled {
+                    eprintln!(
+                        "camera ffmpeg reconnect: exit={status:?}, stalled={stalled}, session={}",
+                        session.display()
+                    );
+                }
                 stop(process).await;
                 child = None;
                 if recover(&root, &config.camera_id).await? > 0 {
@@ -650,6 +768,113 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn closed_list_waits_for_newline_and_rejects_reused_names() {
+        let root = tempfile::tempdir().unwrap();
+        let csv = root.path().join("segments.csv");
+        fs::write(&csv, "segment-100-000000000.part,0.000000,10.000000\nsegment-100-000000001.part,10.000000,20").unwrap();
+        assert_eq!(closed_segments(root.path()).unwrap().len(), 1);
+        fs::write(
+            &csv,
+            "segment-100.part,0.000000,5909.261979\nsegment-100.part,5909.262370,7201.281315\n",
+        )
+        .unwrap();
+        assert!(closed_segments(root.path()).is_err());
+        fs::write(&csv, "../segment-100.part,0,1\n").unwrap();
+        assert!(closed_segments(root.path()).is_err());
+    }
+
+    #[test]
+    fn numbered_segments_keep_timeline_and_legacy_names() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("segments.csv"), "segment-100-000000000.part,0.000000,10.250000\nsegment-100-000000001.part,10.250000,20.500000\n").unwrap();
+        for (name, expected) in [
+            ("segment-100.part", 100000),
+            ("segment-100-000000000.part", 100000),
+            ("segment-100-000000001.mp4", 110250),
+            ("segment-100-000000002.part", 120500),
+        ] {
+            let (start, _) = segment_start(&root.path().join(name)).unwrap();
+            assert_eq!(start.unix_timestamp_nanos() / 1_000_000, expected);
+        }
+        assert!(segment_start(&root.path().join("segment-100-000000003.part")).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_diagnostics_hide_rtsp_credentials() {
+        let url = "rtsp://camera:secret-pass@192.0.2.1/stream";
+        let output = redact_ffmpeg(&format!("Could not open {url}; password secret-pass"), url);
+        assert!(!output.contains("secret-pass"));
+        assert!(!output.contains(url));
+        assert!(output.contains("Could not open"));
+    }
+
+    #[tokio::test]
+    async fn reviewed_quarantine_is_preserved_outside_the_active_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join(".quarantine");
+        fs::create_dir(&archive).unwrap();
+        let file = archive.join("segment-100.corrupt");
+        fs::write(&file, b"preserved evidence").unwrap();
+        fs::write(archive.join("incident.json"), b"{\"reviewed\":true}").unwrap();
+        assert!(manifests(root.path()).unwrap().is_empty());
+        assert_eq!(recover(root.path(), "camera").await.unwrap(), 0);
+        assert_eq!(stats(root.path()).unwrap().2, 0);
+        assert_eq!(fs::read(file).unwrap(), b"preserved evidence");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFMPEG_BIN and FFPROBE_BIN"]
+    async fn buffered_segments_have_unique_files_and_recover_after_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("burst");
+        fs::create_dir(&session).unwrap();
+        let input = root.path().join("input.mp4");
+        fs::write(&input, include_bytes!("../tests/fixtures/blue.mp4")).unwrap();
+        let mut command = Command::new(env::var("FFMPEG_BIN").expect("FFMPEG_BIN required"));
+        // 実時間待ちなしで複数境界を通過させる。旧strftime名では全行が同じ名前になる。
+        command
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-stream_loop",
+                "20",
+                "-i",
+            ])
+            .arg(input)
+            .args(["-map", "0:v:0", "-c", "copy", "-t", "12"]);
+        segment_output(&mut command, &session, 1793560479, 1);
+        let output = command.kill_on_drop(true).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows = closed_segments(&session).unwrap();
+        assert!(rows.len() >= 6);
+        for row in &rows {
+            assert!(session.join(&row.name).exists());
+        }
+        assert_eq!(
+            recover(root.path(), "camera").await.unwrap() as usize,
+            rows.len()
+        );
+        let files = manifests(root.path()).unwrap();
+        assert_eq!(files.len(), rows.len());
+        let mut keys = HashSet::new();
+        for file in files {
+            let segment = read_segment(&file).unwrap();
+            assert!(keys.insert(segment.object_key));
+            assert_eq!(
+                checksum(&file.with_extension("mp4")).unwrap(),
+                segment.checksum
+            );
+        }
+        assert_eq!(stats(root.path()).unwrap().2, 0);
+        assert_eq!(recover(root.path(), "camera").await.unwrap(), 0);
+    }
+
+    #[test]
     fn recording_deadline_survives_reconnects_until_a_segment_completes() {
         let start = Instant::now();
         let deadline = Duration::from_secs(80);
@@ -756,7 +981,8 @@ mod tests {
         fs::create_dir(&session).unwrap();
         let input = root.path().join("input.mp4");
         fs::write(&input, include_bytes!("../tests/fixtures/blue.mp4")).unwrap();
-        let mut child = Command::new(env::var("FFMPEG_BIN").expect("FFMPEG_BIN required"))
+        let mut command = Command::new(env::var("FFMPEG_BIN").expect("FFMPEG_BIN required"));
+        command
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -767,32 +993,14 @@ mod tests {
                 "-i",
             ])
             .arg(input)
-            .args([
-                "-map",
-                "0:v:0",
-                "-c",
-                "copy",
-                "-f",
-                "segment",
-                "-segment_time",
-                "1",
-                "-reset_timestamps",
-                "1",
-                "-strftime",
-                "1",
-                "-segment_format",
-                "mp4",
-                "-segment_format_options",
-                "movflags=+faststart",
-                "-segment_list_type",
-                "csv",
-                "-segment_list_size",
-                "0",
-                "-segment_list",
-            ])
-            .arg(session.join("segments.csv"))
-            .arg(session.join("segment-%s.part"))
-            .env("TZ", "UTC")
+            .args(["-map", "0:v:0", "-c", "copy"]);
+        segment_output(
+            &mut command,
+            &session,
+            OffsetDateTime::now_utc().unix_timestamp(),
+            1,
+        );
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
