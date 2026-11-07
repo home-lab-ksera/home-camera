@@ -4,9 +4,10 @@
 name: Build and Push to Harbor - home-camera
 
 on:
+  # 手動実行はテストとビルドのみ。公開は main への push で実行する。
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
     branches: [ main, master ]
 
@@ -38,73 +39,112 @@ jobs:
       run: |
         docker save home-camera:ci | gzip > /tmp/home-camera-image.tar.gz
 
-    - name: Download verified crane tools
-      shell: bash
-      run: |
-        set -euo pipefail
-        for ARCH in x86_64 arm64; do
-          curl --fail --silent --show-error --location --retry 3 --connect-timeout 30 \
-            "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_$ARCH.tar.gz" \
-            -o "/tmp/crane-$ARCH.tar.gz"
-        done
-        echo "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  /tmp/crane-x86_64.tar.gz" | sha256sum --check
-        echo "898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110  /tmp/crane-arm64.tar.gz" | sha256sum --check
-
     - name: Upload image artifact
       uses: actions/upload-artifact@v4
       with:
         name: home-camera-image
-        path: |
-          /tmp/home-camera-image.tar.gz
-          /tmp/crane-x86_64.tar.gz
-          /tmp/crane-arm64.tar.gz
+        path: /tmp/home-camera-image.tar.gz
         retention-days: 1
 
   push-image:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # OIDC の信頼条件に合わせ、main への push のみ公開する。
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [build-image, recovery-tests]
-    runs-on: harbor-publish-runners  # self-hosted runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     concurrency:
       group: harbor-publish-${{ github.repository }}-home-camera
       cancel-in-progress: false
+    env:
+      HARBOR_URL: harbor.internal.qroksera.com
+      HARBOR_PROJECT: sandbox
+      IMAGE_NAME: home-camera
 
     steps:
+    - name: Check required secrets are available
+      env:
+        TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+        TS_AUDIENCE: ${{ secrets.TS_AUDIENCE }}
+        HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+        HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+      run: |
+        set -euo pipefail
+        for name in TS_OAUTH_CLIENT_ID TS_AUDIENCE HARBOR_USERNAME HARBOR_PASSWORD; do
+          if [[ -z "${!name}" ]]; then
+            echo "::error::Required secret is unavailable: $name"
+            exit 1
+          fi
+        done
+
     - name: Download image artifact
       uses: actions/download-artifact@v4
       with:
         name: home-camera-image
-        path: /tmp
+        path: ${{ runner.temp }}/harbor-image
 
-    - name: Install crane (verified release)
-      shell: bash
+    - name: Connect to Tailscale with GitHub OIDC
+      uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
+      with:
+        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+        audience: ${{ secrets.TS_AUDIENCE }}
+        tags: tag:ci-harbor
+        # subnet route の受け入れは Action が自動設定する。
+        args: --accept-dns=false
+        hostname: home-camera-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Resolve Harbor and verify HTTPS connectivity
       run: |
         set -euo pipefail
-        case "$(uname -m)" in
-          x86_64) ARCH=x86_64; SHA256=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0 ;;
-          aarch64) ARCH=arm64; SHA256=898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110 ;;
-          *) echo "Unsupported architecture" >&2; exit 1 ;;
-        esac
-        mkdir -p "$RUNNER_TEMP/crane-bin"
-        cp "/tmp/crane-$ARCH.tar.gz" "$RUNNER_TEMP/crane.tar.gz"
-        echo "$SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum --check
-        tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
+        printf '192.168.122.100 %s\n' "$HARBOR_URL" | sudo tee -a /etc/hosts > /dev/null
+        # 新しい端末の経路・アクセス設定が反映されるまで待つ。
+        for attempt in {1..6}; do
+          status=$(curl --silent --show-error --connect-timeout 10 --max-time 15 \
+            --output /dev/null --write-out '%{http_code}' "https://$HARBOR_URL/v2/") || status=000
+          if [[ "$status" == 200 || "$status" == 401 ]]; then
+            echo "Harbor registry reached over verified HTTPS (HTTP $status)."
+            exit 0
+          fi
+          echo "Harbor not ready (HTTP $status, attempt $attempt/6)."
+          sleep 5
+        done
+        echo "::error::Cannot reach Harbor over Tailscale. Check subnet route approval and grants."
+        exit 1
 
-    - name: Push versioned image without Docker
-      shell: bash
+    - name: Log in to Harbor
+      env:
+        HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+        HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
       run: |
         set -euo pipefail
         umask 077
         export DOCKER_CONFIG="$RUNNER_TEMP/harbor-auth"
         mkdir -p "$DOCKER_CONFIG"
-        CRANE="$RUNNER_TEMP/crane-bin/crane"
-        HARBOR_URL=$(cat /etc/harbor-auth/HARBOR_URL)
-        HARBOR_PROJECT=$(cat /etc/harbor-auth/HARBOR_PROJECT)
-        HARBOR_USERNAME=$(cat /etc/harbor-auth/HARBOR_USERNAME)
-        "$CRANE" auth login "$HARBOR_URL" --username "$HARBOR_USERNAME" \
-          --password-stdin < /etc/harbor-auth/HARBOR_PASSWORD
-        gunzip -c /tmp/home-camera-image.tar.gz > "$RUNNER_TEMP/image.tar"
+        printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_URL" \
+          --username "$HARBOR_USERNAME" --password-stdin
+
+    - name: Push and verify versioned image
+      run: |
+        set -euo pipefail
+        export DOCKER_CONFIG="$RUNNER_TEMP/harbor-auth"
+        gunzip -c "$RUNNER_TEMP/harbor-image/$IMAGE_NAME-image.tar.gz" | docker load
         VERSION="build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_SHA"
-        "$CRANE" push "$RUNNER_TEMP/image.tar" "$HARBOR_URL/$HARBOR_PROJECT/home-camera:$VERSION"
+        IMAGE="$HARBOR_URL/$HARBOR_PROJECT/$IMAGE_NAME:$VERSION"
+        docker tag "$IMAGE_NAME:ci" "$IMAGE"
+        docker push "$IMAGE"
+        expected=$(docker image inspect "$IMAGE_NAME:ci" --format '{{.Id}}')
+        actual=$(docker manifest inspect "$IMAGE" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')
+        if [[ "$actual" != "$expected" ]]; then
+          echo "::error::Published image config digest does not match the build."
+          exit 1
+        fi
+        {
+          echo '### Harbor publication via Tailscale OIDC'
+          printf '\nImage: `%s`\n' "$IMAGE"
+          printf '\nVerified image config digest: `%s`\n' "$actual"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Check publication is still the default branch head
       id: publication
@@ -119,18 +159,20 @@ jobs:
 
     - name: Promote current build to latest
       if: ${{ steps.publication.outputs.result == 'true' }}
-      shell: bash
       run: |
         set -euo pipefail
         export DOCKER_CONFIG="$RUNNER_TEMP/harbor-auth"
-        HARBOR_URL=$(cat /etc/harbor-auth/HARBOR_URL)
-        HARBOR_PROJECT=$(cat /etc/harbor-auth/HARBOR_PROJECT)
-        VERSION="build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_SHA"
-        "$RUNNER_TEMP/crane-bin/crane" tag "$HARBOR_URL/$HARBOR_PROJECT/home-camera:$VERSION" latest
+        IMAGE="$HARBOR_URL/$HARBOR_PROJECT/$IMAGE_NAME:latest"
+        docker tag "$IMAGE_NAME:ci" "$IMAGE"
+        docker push "$IMAGE"
+        expected=$(docker image inspect "$IMAGE_NAME:ci" --format '{{.Id}}')
+        actual=$(docker manifest inspect "$IMAGE" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')
+        if [[ "$actual" != "$expected" ]]; then
+          echo "::error::Latest image config digest does not match the build."
+          exit 1
+        fi
+        printf '\nPromoted and verified: `%s`\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Cleanup
       if: always()
-      shell: bash
-      run: |
-        rm -rf "$RUNNER_TEMP/harbor-auth" "$RUNNER_TEMP/crane-bin"
-        rm -f "$RUNNER_TEMP/crane.tar.gz" "$RUNNER_TEMP/image.tar" /tmp/home-camera-image.tar.gz /tmp/crane-x86_64.tar.gz /tmp/crane-arm64.tar.gz
+      run: rm -rf "$RUNNER_TEMP/harbor-auth" "$RUNNER_TEMP/harbor-image"
