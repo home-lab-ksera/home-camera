@@ -135,15 +135,18 @@ jobs:
         docker tag "$IMAGE_NAME:ci" "$IMAGE"
         docker push "$IMAGE"
         expected=$(docker image inspect "$IMAGE_NAME:ci" --format '{{.Id}}')
-        actual=$(docker manifest inspect "$IMAGE" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')
-        if [[ "$actual" != "$expected" ]]; then
-          echo "::error::Published image config digest does not match the build."
+        # containerd image store では .Id がタグの manifest digest、従来の image store では config digest になる。
+        published=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}' | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')
+        config=$(docker buildx imagetools inspect "$IMAGE" --raw | python3 -c 'import json, sys; print(json.load(sys.stdin).get("config", {}).get("digest", ""))')
+        if [[ "$expected" != "$published" && "$expected" != "$config" ]]; then
+          echo "::error::Published image config digest does not match the build (local=$expected manifest=$published config=$config)."
           exit 1
         fi
+        actual="$published"
         {
           echo '### Harbor publication via Tailscale OIDC'
           printf '\nImage: `%s`\n' "$IMAGE"
-          printf '\nVerified image config digest: `%s`\n' "$actual"
+          printf '\nVerified image digest: `%s`\n' "$actual"
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Check publication is still the default branch head
@@ -166,11 +169,14 @@ jobs:
         docker tag "$IMAGE_NAME:ci" "$IMAGE"
         docker push "$IMAGE"
         expected=$(docker image inspect "$IMAGE_NAME:ci" --format '{{.Id}}')
-        actual=$(docker manifest inspect "$IMAGE" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')
-        if [[ "$actual" != "$expected" ]]; then
-          echo "::error::Latest image config digest does not match the build."
+        # containerd image store では .Id がタグの manifest digest、従来の image store では config digest になる。
+        published=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}' | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')
+        config=$(docker buildx imagetools inspect "$IMAGE" --raw | python3 -c 'import json, sys; print(json.load(sys.stdin).get("config", {}).get("digest", ""))')
+        if [[ "$expected" != "$published" && "$expected" != "$config" ]]; then
+          echo "::error::Latest image config digest does not match the build (local=$expected manifest=$published config=$config)."
           exit 1
         fi
+        actual="$published"
         printf '\nPromoted and verified: `%s`\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Cleanup
