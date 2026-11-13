@@ -1,9 +1,7 @@
 name: Recording recovery tests
+# build-and-push.yaml から呼び出す。単独では起動しない。
 on:
   workflow_call:
-  pull_request:
-  push:
-    branches: [main, master]
 jobs:
   recordings:
     runs-on: ubuntu-latest
