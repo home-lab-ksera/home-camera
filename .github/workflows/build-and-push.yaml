@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # fmt・clippy・cargo-audit（報告のみ）。rust-toolchain.toml の版で実行する。
+  # fmt・clippy・cargo-audit。rust-toolchain.toml の版で実行し、指摘があれば publish しない。
   verify:
     uses: home-lab-ksera/home-lab-k8s/.github/workflows/rust-verify.yml@main
 
@@ -28,7 +28,7 @@ jobs:
     uses: ./.github/workflows/state-tests.yml
 
   publish:
-    needs: recovery-tests
+    needs: [recovery-tests, verify]
     uses: home-lab-ksera/home-lab-k8s/.github/workflows/publish-harbor.yml@main
     permissions:
       contents: read
