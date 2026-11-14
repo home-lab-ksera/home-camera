@@ -412,7 +412,7 @@ fn stats(root: &Path) -> Result<(u64, f64, u64, u64)> {
 }
 fn allowed(now: OffsetDateTime) -> bool {
     let hour = now.to_offset(UtcOffset::from_hms(9, 0, 0).unwrap()).hour();
-    hour >= 19 || hour < 9
+    !(9..19).contains(&hour)
 }
 async fn stop(child: &mut Child) {
     if let Some(id) = child.id() {
@@ -471,10 +471,10 @@ fn segment_output(command: &mut Command, session: &Path, epoch: i64, seconds: u6
 
 fn redact_ffmpeg(line: &str, rtsp_url: &str) -> String {
     let mut line = line.replace(rtsp_url, "[RTSP URL]");
-    if let Ok(url) = reqwest::Url::parse(rtsp_url) {
-        if let Some(password) = url.password().filter(|value| !value.is_empty()) {
-            line = line.replace(password, "[REDACTED]");
-        }
+    if let Ok(url) = reqwest::Url::parse(rtsp_url)
+        && let Some(password) = url.password().filter(|value| !value.is_empty())
+    {
+        line = line.replace(password, "[REDACTED]");
     }
     line.chars().take(2048).collect()
 }
@@ -673,10 +673,10 @@ async fn transfer(
     http: &reqwest::Client,
 ) -> Result<()> {
     let local = present(file.metadata())?;
-    if let Some(metadata) = &local {
-        if metadata.len() != segment.size || checksum(file)? != segment.checksum {
-            bail!("spool file changed; preserving for inspection");
-        }
+    if let Some(metadata) = &local
+        && (metadata.len() != segment.size || checksum(file)? != segment.checksum)
+    {
+        bail!("spool file changed; preserving for inspection");
     }
     let head = || {
         http.post(format!("{}/s3/head_object", config.api_hub_base_url))
