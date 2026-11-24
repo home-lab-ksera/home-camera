@@ -278,6 +278,7 @@ struct Mock {
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     uploads: Arc<AtomicUsize>,
     unavailable: Arc<std::sync::atomic::AtomicBool>,
+    reject_motion: Arc<std::sync::atomic::AtomicBool>,
 }
 async fn head(State(mock): State<Mock>, Json(value): Json<Value>) -> Response {
     if mock.unavailable.load(Ordering::SeqCst) {
@@ -297,13 +298,144 @@ async fn put(
     State(mock): State<Mock>,
     Query(query): Query<HashMap<String, String>>,
     bytes: Bytes,
-) -> Json<Value> {
+) -> Response {
+    if query["key"].ends_with(".motion.json") && mock.reject_motion.load(Ordering::SeqCst) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     mock.objects
         .lock()
         .unwrap()
         .insert(query["key"].clone(), bytes.to_vec());
     mock.uploads.fetch_add(1, Ordering::SeqCst);
-    Json(json!({"e_tag":"mock"}))
+    Json(json!({"e_tag":"mock"})).into_response()
+}
+
+async fn mock_api_hub(mock: &Mock) -> (AppConfig, tokio::task::JoinHandle<()>) {
+    let app = Router::new()
+        .route("/s3/head_object", post(head))
+        .route("/s3/put_object_stream", post(put))
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vars = HashMap::from([
+        ("RTSP_URL".into(), "rtsp://unused".into()),
+        (
+            "API_HUB_BASE_URL".into(),
+            format!("http://{}", listener.local_addr().unwrap()),
+        ),
+    ]);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (AppConfig::from_map(&vars).unwrap(), server)
+}
+
+fn retry_now(manifest: &Path) -> Segment {
+    let mut segment = read_segment(manifest).unwrap();
+    segment.next_attempt_at = 0;
+    atomic_json(manifest, &segment).unwrap();
+    segment
+}
+
+#[test]
+fn motion_report_sits_next_to_the_recording() {
+    assert_eq!(
+        motion_key("camera/2026/11/24/1-s-0.mp4"),
+        "camera/2026/11/24/1-s-0.motion.json"
+    );
+}
+
+#[tokio::test]
+async fn motion_report_is_uploaded_and_never_blocks_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let session = root.path().join("session");
+    fs::create_dir(&session).unwrap();
+    let mock = Mock::default();
+    let (config, server) = mock_api_hub(&mock).await;
+    let http = reqwest::Client::new();
+    let params = crate::motion::Params::default();
+
+    // 動画として読めないファイルでも、解析の失敗を結果として送り、spool を空ける。
+    let broken = fixture(&session, 200);
+    upload_one(root.path(), &config, &http, Some(&params))
+        .await
+        .unwrap();
+    assert!(!broken.exists() && !broken.with_extension("mp4").exists());
+    let report: Value =
+        serde_json::from_slice(&mock.objects.lock().unwrap()["fixed/200.motion.json"]).unwrap();
+    assert_eq!(report["version"], 1);
+    assert!(report["error"].as_str().is_some_and(|e| !e.is_empty()));
+    assert_eq!(mock.uploads.load(Ordering::SeqCst), 2);
+
+    // 結果の送信が失敗したら録画を残して再試行する。録画自体は送り直さず、
+    // 保存しておいた結果を使う。
+    mock.reject_motion.store(true, Ordering::SeqCst);
+    let pending = fixture(&session, 201);
+    upload_one(root.path(), &config, &http, Some(&params))
+        .await
+        .unwrap();
+    assert!(pending.exists() && pending.with_extension("motion").exists());
+    assert_eq!(retry_now(&pending).motion_attempts, 1);
+    mock.reject_motion.store(false, Ordering::SeqCst);
+    upload_one(root.path(), &config, &http, Some(&params))
+        .await
+        .unwrap();
+    assert!(!pending.exists() && !pending.with_extension("motion").exists());
+    assert!(
+        mock.objects
+            .lock()
+            .unwrap()
+            .contains_key("fixed/201.motion.json")
+    );
+    assert_eq!(mock.uploads.load(Ordering::SeqCst), 4);
+
+    // 送信が失敗し続けたら、決めた回数で諦めて spool を空ける。
+    mock.reject_motion.store(true, Ordering::SeqCst);
+    let dropped = fixture(&session, 202);
+    for attempt in 1..MOTION_PUT_ATTEMPTS {
+        upload_one(root.path(), &config, &http, Some(&params))
+            .await
+            .unwrap();
+        assert_eq!(retry_now(&dropped).motion_attempts, attempt);
+    }
+    upload_one(root.path(), &config, &http, Some(&params))
+        .await
+        .unwrap();
+    assert!(!dropped.exists() && !dropped.with_extension("motion").exists());
+    assert!(
+        !mock
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key("fixed/202.motion.json")
+    );
+    assert_eq!(fs::read_dir(&session).unwrap().count(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires FFMPEG_BIN"]
+async fn uploaded_recording_gets_a_motion_report() {
+    let root = tempfile::tempdir().unwrap();
+    let session = root.path().join("session");
+    fs::create_dir(&session).unwrap();
+    let manifest = fixture(&session, 300);
+    let video = include_bytes!("../../tests/fixtures/blue.mp4");
+    fs::write(manifest.with_extension("mp4"), video).unwrap();
+    let mut segment = read_segment(&manifest).unwrap();
+    segment.size = video.len() as u64;
+    segment.checksum = checksum(&manifest.with_extension("mp4")).unwrap();
+    atomic_json(&manifest, &segment).unwrap();
+    let mock = Mock::default();
+    let (config, server) = mock_api_hub(&mock).await;
+    let params = crate::motion::Params::default();
+    upload_one(root.path(), &config, &reqwest::Client::new(), Some(&params))
+        .await
+        .unwrap();
+    let report: crate::motion::Report =
+        serde_json::from_slice(&mock.objects.lock().unwrap()["fixed/300.motion.json"]).unwrap();
+    assert!(report.analyzed_seconds > 0.0);
+    assert!(report.events.is_empty());
+    server.abort();
 }
 
 #[tokio::test]
@@ -342,7 +474,7 @@ async fn spool_survives_s3_outages() {
         axum::serve(listener, app).await.unwrap();
     });
     let http = reqwest::Client::new();
-    assert!(upload_one(root.path(), &config, &http).await.unwrap());
+    assert!(upload_one(root.path(), &config, &http, None).await.unwrap());
     assert!(manifest.exists());
     assert_eq!(mock.uploads.load(Ordering::SeqCst), 0);
     mock.unavailable.store(false, Ordering::SeqCst);
@@ -350,7 +482,7 @@ async fn spool_survives_s3_outages() {
     assert!(retry.next_attempt_at > 0);
     retry.next_attempt_at = 0;
     atomic_json(&manifest, &retry).unwrap();
-    assert!(upload_one(root.path(), &config, &http).await.unwrap());
+    assert!(upload_one(root.path(), &config, &http, None).await.unwrap());
     assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
     assert!(!manifest.exists());
     assert!(!path.with_extension("mp4").exists());
@@ -367,7 +499,7 @@ async fn spool_survives_s3_outages() {
         segment.object_key,
         include_bytes!("../../tests/fixtures/blue.mp4").to_vec(),
     );
-    assert!(upload_one(root.path(), &config, &http).await.unwrap());
+    assert!(upload_one(root.path(), &config, &http, None).await.unwrap());
     assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
     fs::write(session.join("segment-1.part"), b"interrupted").unwrap();
     recover(root.path(), "camera").await.unwrap();
@@ -395,6 +527,7 @@ fn fixture(session: &Path, epoch: i64) -> PathBuf {
             checksum: checksum(&file).unwrap(),
             attempts: 0,
             next_attempt_at: 0,
+            motion_attempts: 0,
         },
     )
     .unwrap();
@@ -443,7 +576,7 @@ async fn invalid_manifests_do_not_block_upload_or_disappear_on_recovery() {
     let http = reqwest::Client::new();
     for _ in 0..2 {
         recover(root.path(), "camera").await.unwrap();
-        upload_one(root.path(), &config, &http).await.unwrap();
+        upload_one(root.path(), &config, &http, None).await.unwrap();
         for path in [&malformed, &missing_field, &invalid_time] {
             assert!(path.exists() && path.with_extension("mp4").exists());
         }
@@ -459,7 +592,7 @@ async fn invalid_manifests_do_not_block_upload_or_disappear_on_recovery() {
         .unwrap()
         .insert(segment.object_key, b"video fixture".to_vec());
     fs::remove_file(half_deleted.with_extension("mp4")).unwrap();
-    upload_one(root.path(), &config, &http).await.unwrap();
+    upload_one(root.path(), &config, &http, None).await.unwrap();
     assert!(!half_deleted.exists());
     assert_eq!(mock.uploads.load(Ordering::SeqCst), 1);
     // 両方欠損、remoteサイズ不一致、checksum不一致は保持。他の転送は進める。
@@ -473,7 +606,7 @@ async fn invalid_manifests_do_not_block_upload_or_disappear_on_recovery() {
     let changed = fixture(&session, 107);
     fs::write(changed.with_extension("mp4"), b"changed").unwrap();
     let good = fixture(&session, 108);
-    upload_one(root.path(), &config, &http).await.unwrap();
+    upload_one(root.path(), &config, &http, None).await.unwrap();
     assert!(lost.exists() && mismatch.exists() && changed.exists());
     assert!(!good.exists());
     assert_eq!(mock.uploads.load(Ordering::SeqCst), 2);

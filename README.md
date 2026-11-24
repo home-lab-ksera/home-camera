@@ -12,7 +12,8 @@
 | 引数 | 内容 |
 |---|---|
 | `--record` | `recorder.lock` を取り、RTSP を録画して、完成した mp4 と manifest を spool に確定する |
-| `--upload` | `uploader.lock` を取り、完成したファイルを api-hub 経由で S3 に送り、確認できたら spool から消す |
+| `--upload` | `uploader.lock` を取り、完成したファイルを api-hub 経由で S3 に送り、動きのあった区間を解析して結果も送り、spool から消す |
+| `--analyze [--debug] FILE.mp4` | 調整用。録画 1 本を解析して、結果の JSON を標準出力に出す。`--debug` は各フレームの値も出す |
 
 壊れたファイルや manifest は消さずに残します。容量が足りないときは、未送信のファイルを消さずに録画を止めます。
 
@@ -30,6 +31,12 @@
 | `FFMPEG_VIDEO_CODEC`、`FFMPEG_AUDIO_CODEC` | `copy` | codec |
 | `FFMPEG_AUDIO_BITRATE` | `128k` | 音声を再エンコードするときの bitrate |
 | `FFMPEG_PRESET`、`FFMPEG_CRF` | `veryfast`、`23` | libx264 を使うときの設定（CRF は 0〜51） |
+| `MOTION_ANALYSIS` | （有効） | `off` で、uploader の動きの解析を止める |
+| `MOTION_THRESHOLD` | `0.03` | 画面のこの割合以上が1秒前から変わったフレームを「動きあり」とする |
+| `MOTION_PIXEL_DELTA` | `20` | 明るさがこれを超えて変わった画素を「変わった」とする（0〜255） |
+| `MOTION_MIN_SECONDS` | `3` | 「動きあり」がこの秒数以上続いたものだけを区間にする |
+| `MOTION_MERGE_GAP_SECONDS` | `60` | この秒数未満の途切れは前後の区間をつなげる |
+| `MOTION_MASKS` | （なし） | 解析から外す領域。`x,y,w,h;...`（画面に対する 0〜1 の割合） |
 
 本番の StatefulSet、PVC、Secret の参照は、[home-lab-k8s の manifests/apps/home-camera/](https://github.com/home-lab-ksera/home-lab-k8s/tree/main/manifests/apps/home-camera) が正本です。
 
@@ -37,10 +44,10 @@
 
 ```bash
 cargo test --locked
-FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe cargo test --locked --lib persistent::tests -- --ignored
+FFMPEG_BIN=/path/to/ffmpeg FFPROBE_BIN=/path/to/ffprobe cargo test --locked --lib -- --ignored
 ```
 
-2 行目は回復の試験で、FFmpeg が要ります。人工の映像と、模擬の HTTP / RTSP を使います。
+2 行目は回復と動きの解析の試験で、FFmpeg が要ります。人工の映像と、模擬の HTTP / RTSP を使います。
 
 ## 配布
 

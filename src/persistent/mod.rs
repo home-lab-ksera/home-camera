@@ -28,15 +28,23 @@ use spool::*;
 use uploader::*;
 
 pub async fn dispatch() -> Result<()> {
+    const USAGE: &str = "Usage: home-camera --record|--upload|--analyze [--debug] FILE.mp4";
     let args: Vec<_> = env::args().skip(1).collect();
-    if args.len() != 1 {
-        bail!("Usage: home-camera --record|--upload");
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--record"] => recorder().await?,
+        ["--upload"] => uploader().await?,
+        // 調整用。録画1本を解析し、結果を JSON で標準出力に出す。
+        ["--analyze", file] => analyze(file, false)?,
+        ["--analyze", "--debug", file] => analyze(file, true)?,
+        _ => bail!(USAGE),
     }
-    match args[0].as_str() {
-        "--record" => recorder().await?,
-        "--upload" => uploader().await?,
-        _ => bail!("Usage: home-camera --record|--upload"),
-    }
+    Ok(())
+}
+
+fn analyze(file: &str, debug: bool) -> Result<()> {
+    let params = crate::motion::Params::from_env()?;
+    let report = crate::motion::analyze_file(Path::new(file), &params, debug)?;
+    println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
 

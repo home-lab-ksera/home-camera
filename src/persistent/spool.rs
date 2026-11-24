@@ -16,6 +16,9 @@ pub(super) struct Segment {
     pub(super) attempts: u32,
     #[serde(default)]
     pub(super) next_attempt_at: i64,
+    /// 録画の送信後に、解析結果の送信に失敗した回数。
+    #[serde(default)]
+    pub(super) motion_attempts: u32,
 }
 
 pub(super) fn read_segment(path: &Path) -> Result<Segment> {
@@ -251,6 +254,7 @@ pub(super) async fn finish(path: &Path, camera: &str) -> Result<()> {
         checksum: checksum(&mp4)?,
         attempts: 0,
         next_attempt_at: 0,
+        motion_attempts: 0,
     };
     atomic_json(&mp4.with_extension("json"), &segment)?;
     Ok(())
