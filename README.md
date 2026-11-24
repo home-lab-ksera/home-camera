@@ -13,6 +13,7 @@
 |---|---|
 | `--record` | `recorder.lock` を取り、RTSP を録画して、完成した mp4 と manifest を spool に確定する |
 | `--upload` | `uploader.lock` を取り、完成したファイルを api-hub 経由で S3 に送り、動きのあった区間を解析して結果も送り、spool から消す |
+| `--summary` | 朝の CronJob。前の晩（JST 09:00 までの24時間）に始まった録画の動きの区間を、文字だけで Slack に送る（api-hub の通知キュー経由） |
 | `--analyze [--debug] FILE.mp4` | 調整用。録画 1 本を解析して、結果の JSON を標準出力に出す。`--debug` は各フレームの値も出す |
 
 壊れたファイルや manifest は消さずに残します。容量が足りないときは、未送信のファイルを消さずに録画を止めます。
@@ -31,6 +32,7 @@
 | `FFMPEG_VIDEO_CODEC`、`FFMPEG_AUDIO_CODEC` | `copy` | codec |
 | `FFMPEG_AUDIO_BITRATE` | `128k` | 音声を再エンコードするときの bitrate |
 | `FFMPEG_PRESET`、`FFMPEG_CRF` | `veryfast`、`23` | libx264 を使うときの設定（CRF は 0〜51） |
+| `SLACK_CHANNEL` | （`--summary` で必須） | 朝の通知を送る Slack のチャンネル ID |
 | `MOTION_ANALYSIS` | （有効） | `off` で、uploader の動きの解析を止める |
 | `MOTION_THRESHOLD` | `0.03` | 画面のこの割合以上が1秒前から変わったフレームを「動きあり」とする |
 | `MOTION_PIXEL_DELTA` | `20` | 明るさがこれを超えて変わった画素を「変わった」とする（0〜255） |

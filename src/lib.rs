@@ -5,3 +5,4 @@ pub mod storage;
 
 pub mod motion;
 pub mod persistent;
+pub mod summary;
