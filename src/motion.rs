@@ -6,13 +6,16 @@
 //! 誤検出を減らすため、割合がしきい値を一定時間以上続けて超えたときだけ区間にする。
 //! 画面全体が一度に変わったもの（赤外線への切り替えや照明）は `Lighting` として分ける。
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     env,
     io::Read,
     path::Path,
     process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 /// 解析の設定。既定値は誤検出を減らす側に寄せている。
@@ -126,7 +129,7 @@ pub fn parse_masks(raw: &str) -> Result<Vec<[f32; 4]>> {
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     Motion,
@@ -134,7 +137,7 @@ pub enum EventKind {
 }
 
 /// 見つかった区間。時刻は録画の先頭からの秒数。
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub kind: EventKind,
     pub start: f32,
@@ -143,16 +146,16 @@ pub struct Event {
     pub peak: f32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
     pub version: u32,
     pub analyzed_seconds: f32,
     pub events: Vec<Event>,
     /// 調整用。各フレームの「変化した画素の割合」。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scores: Option<Vec<f32>>,
     /// 調整用。画素ごとに「前のフレームから変化した」回数。時計表示などの位置を探すのに使う。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Vec<u32>>,
 }
 
@@ -328,6 +331,20 @@ fn classify(score: f32, lighting: bool, params: &Params) -> Option<EventKind> {
 
 /// FFmpeg で録画をデコードして解析する。`FFMPEG_BIN` があればそれを使う。
 pub fn analyze_file(path: &Path, params: &Params, include_debug: bool) -> Result<Report> {
+    analyze(path, params, include_debug, None)
+}
+
+/// `analyze_file` と同じだが、`timeout` を過ぎたら FFmpeg を止めて失敗にする。
+pub fn analyze_file_within(path: &Path, params: &Params, timeout: Duration) -> Result<Report> {
+    analyze(path, params, false, Some(timeout))
+}
+
+fn analyze(
+    path: &Path,
+    params: &Params,
+    include_debug: bool,
+    timeout: Option<Duration>,
+) -> Result<Report> {
     let ffmpeg = env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".into());
     let filter = format!(
         "fps={},scale={}:{}:flags=area,format=gray",
@@ -345,16 +362,41 @@ pub fn analyze_file(path: &Path, params: &Params, include_debug: bool) -> Result
         .spawn()
         .with_context(|| format!("failed to start {ffmpeg}"))?;
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
+    // 読み終わる（送信側が落ちる）か制限時間が来るまで待ち、時間切れなら FFmpeg を止める。
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = timeout.map(|timeout| {
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        thread::spawn(move || {
+            let expired = finished.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout);
+            if expired {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            expired
+        })
+    });
     let mut detector = Detector::new(params.clone());
     let mut frame = vec![0u8; params.frame_len()];
     loop {
         match stdout.read_exact(&mut frame) {
             Ok(()) => detector.push(&frame),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e).context("reading ffmpeg output"),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("reading ffmpeg output");
+            }
         }
     }
     let output = child.wait_with_output().context("waiting for ffmpeg")?;
+    drop(done);
+    if let Some(watchdog) = watchdog
+        && watchdog.join().unwrap_or(false)
+    {
+        bail!(
+            "ffmpeg did not finish within {:?}",
+            timeout.unwrap_or_default()
+        );
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("ffmpeg failed ({}): {}", output.status, stderr.trim());
