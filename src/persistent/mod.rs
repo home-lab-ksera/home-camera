@@ -28,11 +28,14 @@ use spool::*;
 use uploader::*;
 
 pub async fn dispatch() -> Result<()> {
-    const USAGE: &str = "Usage: home-camera --record|--upload|--analyze [--debug] FILE.mp4";
+    const USAGE: &str =
+        "Usage: home-camera --record|--upload|--summary|--analyze [--debug] FILE.mp4";
     let args: Vec<_> = env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["--record"] => recorder().await?,
         ["--upload"] => uploader().await?,
+        // 朝の CronJob。前の晩の動きを Slack に送る。
+        ["--summary"] => crate::summary::run().await?,
         // 調整用。録画1本を解析し、結果を JSON で標準出力に出す。
         ["--analyze", file] => analyze(file, false)?,
         ["--analyze", "--debug", file] => analyze(file, true)?,
